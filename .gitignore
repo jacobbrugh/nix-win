@@ -1,0 +1,15 @@
+hz4jqnhzb8i24i048ds41ky2hzgvwwsk-nix-win-dsc-modules/*
+modules/dsc/generated/*-nix-win-dsc-modules/
+
+# Nix build symlinks
+result
+result-*
+
+# direnv
+.direnv/
+
+# Editor swap files
+*.swp
+
+# macOS
+.DS_Store
