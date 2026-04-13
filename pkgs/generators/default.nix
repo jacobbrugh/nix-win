@@ -10,11 +10,6 @@
 #   microsoft/omi 9c950a8d                        — PSDesiredStateConfiguration/File MOF
 #   PowerShell/PSDscResources 7064eda5            — all 12 PSDscResources MOFs
 #
-# Usage (in flake.nix):
-#   generators = forAllSystems (system:
-#     import ./pkgs/generators { pkgs = nixpkgs.legacyPackages.${system}; inherit lib; }
-#   );
-#
 # To regenerate all checked-in modules:
 #   nix build .#packages.x86_64-linux.generate-dsc-modules
 #   cp -r result/ modules/dsc/generated/
@@ -110,7 +105,7 @@ sys.stdout.buffer.write(z.read('DSCResources/MSFT_WindowsDefender/MSFT_WindowsDe
   fromDscSource =
     name: src: extraArgs:
     pkgs.runCommand "${name}.nix"
-      { nativeBuildInputs = [ pkgs.python3 pkgs.nixfmt-rfc-style ]; }
+      { nativeBuildInputs = [ pkgs.python3 pkgs.nixfmt ]; }
       ''
         python3 ${dsc2nix} ${src} ${lib.escapeShellArgs extraArgs} > ./raw.nix
         nixfmt ./raw.nix
@@ -122,7 +117,7 @@ sys.stdout.buffer.write(z.read('DSCResources/MSFT_WindowsDefender/MSFT_WindowsDe
   fromMof =
     name: src: extraArgs:
     pkgs.runCommand "${name}.nix"
-      { nativeBuildInputs = [ pkgs.python3 pkgs.nixfmt-rfc-style ]; }
+      { nativeBuildInputs = [ pkgs.python3 pkgs.nixfmt ]; }
       ''
         python3 ${dsc2nix} --mof ${src} ${lib.escapeShellArgs extraArgs} > ./raw.nix
         nixfmt ./raw.nix

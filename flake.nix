@@ -37,16 +37,6 @@
       # Re-export for consumers who want to extend the module system
       nixosModules.default = ./modules/module-list.nix;
 
-      # DSC resource manifest → Nix module generator.
-      # Use fromDscManifest / fromDscManifests to regenerate modules/dsc/generated/.
-      generators = forAllSystems (
-        system:
-        import ./pkgs/generators {
-          pkgs = nixpkgs.legacyPackages.${system};
-          inherit lib;
-        }
-      );
-
       # Regenerate all checked-in DSC modules:
       #   nix build .#packages.x86_64-linux.generate-dsc-modules
       #   cp result/windows_service.nix modules/dsc/generated/windows_service.nix
