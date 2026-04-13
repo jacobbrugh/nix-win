@@ -34,9 +34,6 @@
         in
         evalResult;
 
-      # Re-export for consumers who want to extend the module system
-      nixosModules.default = ./modules/module-list.nix;
-
       # Regenerate all checked-in DSC modules:
       #   nix build .#packages.x86_64-linux.generate-dsc-modules
       #   cp result/windows_service.nix modules/dsc/generated/windows_service.nix
