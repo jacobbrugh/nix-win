@@ -9,17 +9,19 @@
 let
   cfg = config.win.scoop;
 
-  # Generate scoopfile.json matching Scoop's import format
+  # Generate scoopfile.json matching Scoop's import format.
+  # `scoop import` honors the Version field by passing name@version to
+  # `scoop install`, so pinning works through the normal import path.
   scoopfileContent = {
     buckets = lib.mapAttrsToList (name: source: {
       Name = name;
       Source = source;
     }) cfg.buckets;
-    apps = lib.mapAttrsToList (name: pkg: {
-      Name = name;
-      Source = pkg.bucket;
-      Info = "64bit";
-    }) cfg.packages;
+    apps = lib.mapAttrsToList (
+      name: pkg:
+      { Name = name; Source = pkg.bucket; Info = "64bit"; }
+      // lib.optionalAttrs (pkg.version != null) { Version = pkg.version; }
+    ) cfg.packages;
   };
 
   scoopfile = pkgs.writeText "scoopfile.json" (builtins.toJSON scoopfileContent);
@@ -47,13 +49,23 @@ in
             type = lib.types.str;
             description = "Which bucket this package comes from.";
           };
+          options.version = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = ''
+              Pin to a specific package version. When null (default),
+              Scoop installs whatever the bucket currently ships.
+              When set, emitted as the `Version` field in scoopfile.json
+              so `scoop import` invokes `scoop install name@version`.
+            '';
+          };
         }
       );
       default = { };
       description = "Scoop packages to install, keyed by package name.";
       example = lib.literalExpression ''
         {
-          bat = { bucket = "main"; };
+          bat = { bucket = "main"; version = "0.26.1"; };
           autohotkey = { bucket = "extras"; };
         }
       '';
