@@ -21,9 +21,12 @@ let
     + lib.concatStringsSep "\n" (
       lib.mapAttrsToList (
         id: pkg:
+        let
+          versionFlag = lib.optionalString (pkg.version != null) " --version \"${pkg.version}\"";
+        in
         ''
           Write-Host "  winget: ${id}" -ForegroundColor Gray
-          winget install --id "${id}" --source "${pkg.source}" --accept-source-agreements --accept-package-agreements --silent${upgradeFlag} 2>$null
+          winget install --id "${id}" --source "${pkg.source}"${versionFlag} --accept-source-agreements --accept-package-agreements --silent${upgradeFlag} 2>$null
         ''
       ) cfg.packages
     )
@@ -47,13 +50,22 @@ in
             default = "winget";
             description = "WinGet source name.";
           };
+          options.version = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = ''
+              Pin to a specific package version. When null (default),
+              WinGet installs the latest available version. When set,
+              passed as `--version` to `winget install`.
+            '';
+          };
         }
       );
       default = { };
       description = "WinGet packages to install, keyed by package ID.";
       example = lib.literalExpression ''
         {
-          "Microsoft.PowerShell" = {};
+          "Microsoft.PowerShell" = { version = "7.4.6.0"; };
           "AgileBits.1Password" = {};
         }
       '';
