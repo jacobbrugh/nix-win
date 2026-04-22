@@ -15,6 +15,7 @@ let
     version = 1;
     stateVersion = cfg.stateVersion;
     files = config.system.build.fileManifest;
+    links = config.system.build.linkManifest;
     scoop = {
       enable = config.win.scoop.enable;
     };
@@ -57,6 +58,57 @@ in
         type = lib.types.listOf lib.types.attrs;
         default = [ ];
         description = "List of file manifest entries for state tracking.";
+      };
+
+      linkManifest = lib.mkOption {
+        type = lib.types.listOf (
+          lib.types.submodule {
+            options = {
+              path = lib.mkOption {
+                type = lib.types.str;
+                description = "Link path relative to its targetRoot.";
+              };
+              source = lib.mkOption {
+                type = lib.types.str;
+                description = ''
+                  Absolute Windows path the link resolves to. May contain
+                  PowerShell environment variable references such as
+                  `$env:USERPROFILE`; the nix-win CLI expands them at
+                  activation.
+                '';
+              };
+              targetRoot = lib.mkOption {
+                type = lib.types.enum [
+                  "home"
+                  "appdata-local"
+                  "appdata-roaming"
+                  "programdata"
+                ];
+                description = "Base directory the link's path is rooted under.";
+              };
+              linkType = lib.mkOption {
+                type = lib.types.enum [
+                  "junction"
+                  "symlink"
+                ];
+                description = ''
+                  NTFS directory junction (unprivileged, local-only, dirs
+                  only) or symbolic link (files or dirs, needs Developer
+                  Mode or admin).
+                '';
+              };
+              force = lib.mkOption {
+                type = lib.types.bool;
+                description = ''
+                  Whether to replace an existing regular file or directory
+                  at the target path with the link.
+                '';
+              };
+            };
+          }
+        );
+        default = [ ];
+        description = "List of directory-junction / symlink manifest entries for state tracking.";
       };
 
       scoopfile = lib.mkOption {

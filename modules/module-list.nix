@@ -4,6 +4,7 @@
   ./system.nix
   ./user.nix
   ./files.nix
+  ./links.nix
   ./activation.nix
   ./scoop.nix
   ./winget.nix
