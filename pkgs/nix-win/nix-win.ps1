@@ -100,6 +100,7 @@ function Get-State {
         currentGeneration = 0
         storePath         = ""
         files             = @{}
+        links             = @{}
     }
 }
 
@@ -120,6 +121,131 @@ function Resolve-TargetRoot {
         "programdata" { return $env:ProgramData }
         default { throw "Unknown target root: $Root" }
     }
+}
+
+# ── Link Deployment ────────────────────────────────────────────────────────
+# DSC's PSDesiredStateConfiguration/File resource can't create directory
+# junctions or symbolic links, so the CLI applies them directly from the
+# manifest's `links` array. State tracking mirrors the file side:
+# declarations removed from config are unlinked on the next switch as long
+# as the on-disk target is still a reparse point (real files/dirs left
+# alone for safety).
+
+function Expand-LinkString {
+    param([string]$Value)
+    # Expand $env:FOO references so the manifest can declare sources in
+    # user-independent form (e.g. "$env:USERPROFILE\...").
+    return $ExecutionContext.InvokeCommand.ExpandString($Value)
+}
+
+function Remove-ManagedLink {
+    param([string]$Path)
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if (-not $item) { return }
+    if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        Write-Host "  unlink $Path" -ForegroundColor DarkGray
+        # Remove-Item on a junction deletes the reparse point, not the
+        # junction target. -Recurse:$false is belt and suspenders.
+        Remove-Item -LiteralPath $Path -Force -Recurse:$false -ErrorAction SilentlyContinue
+    } else {
+        Write-Warning "  skip unlink: $Path is not a reparse point (real file/dir left alone)"
+    }
+}
+
+function New-ManagedLink {
+    param(
+        [string]$TargetPath,
+        [string]$Source,
+        [string]$LinkType,
+        [bool]$Force
+    )
+
+    # Ensure the parent directory exists before trying to create the link.
+    $parent = Split-Path -Parent $TargetPath
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+
+    $existing = Get-Item -LiteralPath $TargetPath -Force -ErrorAction SilentlyContinue
+    if ($existing) {
+        if ($existing.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            # Already a link/junction. If it already points at our source,
+            # we're done; otherwise replace it.
+            if ($existing.Target -and $existing.Target -eq $Source) { return }
+            Remove-Item -LiteralPath $TargetPath -Force
+        } elseif ($Force) {
+            Remove-Item -LiteralPath $TargetPath -Force -Recurse
+        } else {
+            Write-Warning "  skip link: $TargetPath is a real file/dir (set force=true to replace)"
+            return
+        }
+    }
+
+    $nativeType = switch ($LinkType) {
+        "junction" { "Junction" }
+        "symlink"  { "SymbolicLink" }
+        default    { throw "Unknown linkType: $LinkType" }
+    }
+    Write-Host "  link $TargetPath -> $Source ($LinkType)" -ForegroundColor DarkGray
+    New-Item -ItemType $nativeType -Path $TargetPath -Target $Source -Force | Out-Null
+}
+
+function Deploy-Links {
+    param(
+        [string]$WinStorePath,
+        [hashtable]$PrevLinks
+    )
+
+    $newLinks = @{}
+
+    $manifestFile = Join-Path $WinStorePath "manifest.json"
+    $declaredLinks = @()
+    if (Test-Path -LiteralPath $manifestFile) {
+        $m = Get-Content -LiteralPath $manifestFile -Raw | ConvertFrom-Json
+        if ($m -and $m.PSObject.Properties['links'] -and $m.links) {
+            $declaredLinks = @($m.links)
+        }
+    }
+
+    # Index declared keys up front so the removal pass can diff against the
+    # previous generation's state before we start mutating anything.
+    $newKeys = @{}
+    foreach ($entry in $declaredLinks) {
+        $base = Resolve-TargetRoot $entry.targetRoot
+        $targetPath = Join-Path $base $entry.path
+        $newKeys[$targetPath.Replace('\', '/')] = $true
+    }
+
+    # Removal pass: anything that was managed last generation but isn't
+    # declared now gets unlinked (only if it's still a reparse point).
+    foreach ($key in @($PrevLinks.Keys)) {
+        if (-not $newKeys.ContainsKey($key)) {
+            $path = $key -replace '/', '\'
+            Remove-ManagedLink -Path $path
+        }
+    }
+
+    # Creation pass: materialize every declared link.
+    foreach ($entry in $declaredLinks) {
+        $base = Resolve-TargetRoot $entry.targetRoot
+        $targetPath = Join-Path $base $entry.path
+        $source = Expand-LinkString $entry.source
+        $force = [bool]$entry.force
+
+        New-ManagedLink `
+            -TargetPath $targetPath `
+            -Source $source `
+            -LinkType $entry.linkType `
+            -Force $force
+
+        $newLinks[$targetPath.Replace('\', '/')] = @{
+            status   = "managed"
+            linkType = $entry.linkType
+            source   = $source
+        }
+    }
+
+    return $newLinks
 }
 
 # ── File Deployment ────────────────────────────────────────────────────────
@@ -183,6 +309,7 @@ function Invoke-Switch {
     $build = Invoke-Build
     $state = Get-State
     $prevFiles = if ($state.files) { $state.files } else { @{} }
+    $prevLinks = if ($state.ContainsKey('links') -and $state.links) { $state.links } else { @{} }
 
     $script:NewGeneration = $state.currentGeneration + 1
     $genDir = Join-Path $GenerationsDir $script:NewGeneration
@@ -201,6 +328,9 @@ function Invoke-Switch {
     Write-Host "`nnix-win: deploying files..." -ForegroundColor Cyan
     $newFiles = Deploy-Files -WinStorePath $build.WinPath -PrevFiles $prevFiles
 
+    Write-Host "`nnix-win: deploying links..." -ForegroundColor Cyan
+    $newLinks = Deploy-Links -WinStorePath $build.WinPath -PrevLinks $prevLinks
+
     Write-Host "`nnix-win: running activation scripts..." -ForegroundColor Cyan
     $env:NIX_WIN_STORE_PATH = $build.WinPath
     $activateScript = Join-Path $build.WinPath "activate.ps1"
@@ -214,6 +344,7 @@ function Invoke-Switch {
         storePath         = $build.StorePath
         activatedAt       = (Get-Date -Format "o")
         files             = $newFiles
+        links             = $newLinks
     }
     Save-State $newState
 
