@@ -18,21 +18,42 @@
       forAllSystems = lib.genAttrs supportedSystems;
     in
     {
-      lib.winSystem =
-        {
-          modules ? [ ],
-          specialArgs ? { },
-          pkgs ? null,
-        }:
+      lib = {
+        winSystem =
+          {
+            modules ? [ ],
+            specialArgs ? { },
+            pkgs ? null,
+          }:
+          let
+            evalResult = import ./eval-config.nix {
+              inherit lib;
+              inherit (nixpkgs) legacyPackages;
+            } {
+              inherit modules specialArgs pkgs;
+            };
+          in
+          evalResult;
+      }
+      # Per-system helpers. Exposes the Rust cross-compile wrapper so
+      # consumer flakes can build Windows binaries from their own
+      # derivations:
+      #
+      #   inputs.nix-win.lib.${system}.buildWindowsRustPackage {
+      #     pname = "foo"; version = "0.1.0"; src = ./.;
+      #     cargoHash = lib.fakeHash;
+      #   };
+      //
+      forAllSystems (
+        system:
         let
-          evalResult = import ./eval-config.nix {
-            inherit lib;
-            inherit (nixpkgs) legacyPackages;
-          } {
-            inherit modules specialArgs pkgs;
-          };
+          pkgs = nixpkgs.legacyPackages.${system};
+          winLib = import ./lib { inherit lib pkgs; };
         in
-        evalResult;
+        {
+          inherit (winLib) buildWindowsRustPackage;
+        }
+      );
 
       # Regenerate all checked-in DSC modules:
       #   nix build .#packages.x86_64-linux.generate-dsc-modules
