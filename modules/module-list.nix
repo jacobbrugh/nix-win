@@ -5,6 +5,8 @@
   ./user.nix
   ./files.nix
   ./links.nix
+  ./packages.nix
+  ./environment.nix
   ./activation.nix
   ./scoop.nix
   ./winget.nix

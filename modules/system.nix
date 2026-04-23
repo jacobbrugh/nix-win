@@ -54,6 +54,16 @@ in
         description = "Derivation containing all managed files.";
       };
 
+      packages = lib.mkOption {
+        type = lib.types.nullOr lib.types.package;
+        default = null;
+        description = ''
+          Derivation containing all Nix-built Windows packages
+          declared via `win.packages`, laid out under the same
+          `home/`, `appdata-local/`, etc. roots as `system.build.files`.
+        '';
+      };
+
       fileManifest = lib.mkOption {
         type = lib.types.listOf lib.types.attrs;
         default = [ ];
@@ -134,6 +144,16 @@ in
         default = null;
         description = "Generated PowerShell modules manifest.";
       };
+
+      environmentConfig = lib.mkOption {
+        type = lib.types.nullOr lib.types.package;
+        default = null;
+        description = ''
+          Generated user-path.json consumed by the userEnvironment
+          activation phase. Placed under
+          `$out/environment/user-path.json` in the toplevel.
+        '';
+      };
     };
   };
 
@@ -150,6 +170,15 @@ in
     if [ -d "${cfg.build.files}" ] && [ "$(ls -A ${cfg.build.files})" ]; then
       cp -r ${cfg.build.files}/* $out/ 2>/dev/null || true
     fi
+
+    # Packages tree — merges alongside the files tree under the same
+    # home/, appdata-local/, etc. roots so Deploy-Files in the CLI
+    # picks everything up with a single pass.
+    ${lib.optionalString (cfg.build.packages != null) ''
+      if [ -d "${cfg.build.packages}" ] && [ "$(ls -A ${cfg.build.packages})" ]; then
+        cp -r ${cfg.build.packages}/* $out/ 2>/dev/null || true
+      fi
+    ''}
 
     # Scoop
     ${lib.optionalString (cfg.build.scoopfile != null) ''
@@ -173,6 +202,12 @@ in
     ${lib.optionalString (cfg.build.psmodulesManifest != null) ''
       mkdir -p $out/powershell
       cp ${cfg.build.psmodulesManifest} $out/powershell/psmodules.json
+    ''}
+
+    # Environment (user PATH management)
+    ${lib.optionalString (cfg.build.environmentConfig != null) ''
+      mkdir -p $out/environment
+      cp ${cfg.build.environmentConfig} $out/environment/user-path.json
     ''}
   '';
 }
