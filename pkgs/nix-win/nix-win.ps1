@@ -76,11 +76,16 @@ function Get-StorePath {
     $uri = "$FlakeUri#$attr.config.system.build.toplevel"
 
     Write-Host "nix-win: building $uri ..." -ForegroundColor Cyan
-    $storePath = Invoke-Wsl "nix build '$uri' --no-link --print-out-paths --no-write-lock-file 2>/dev/null"
-    $storePath = ($storePath | Select-Object -Last 1).Trim()
+    # Keep stderr on — `2>/dev/null` here would silently discard
+    # nix's actual error message on a failed build, leaving the caller
+    # with nothing but "WSL command failed (exit 1)". `--print-out-paths`
+    # writes the resolved store path as the last line of stdout, so
+    # Select-Object -Last 1 still isolates it from progress chatter.
+    $output = Invoke-Wsl "nix build '$uri' --no-link --print-out-paths --no-write-lock-file"
+    $storePath = ($output | Select-Object -Last 1).Trim()
 
     if (-not $storePath -or -not $storePath.StartsWith("/nix/store/")) {
-        throw "nix build returned invalid store path: $storePath"
+        throw "nix build returned invalid store path. Full output:`n$output"
     }
 
     return $storePath
