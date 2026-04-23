@@ -1,0 +1,12 @@
+# Evaluated by Nix on Linux/WSL: checked-out line endings must stay LF
+# regardless of the user's global `core.autocrlf` setting. CRLF in `.nix`
+# source leaks into derivation `buildCommand` attrs and trips nixpkgs
+# builders with `line 1: $'\r': command not found`.
+* text=auto eol=lf
+
+# PowerShell scripts are executed on Windows but are consumed from the
+# WSL Nix store, so they also stay LF in the repo — nix-win's file
+# deployment pipeline is responsible for CRLF conversion at install time.
+*.ps1  text eol=lf
+*.psm1 text eol=lf
+*.psd1 text eol=lf
