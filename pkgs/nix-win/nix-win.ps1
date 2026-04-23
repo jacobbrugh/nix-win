@@ -335,10 +335,47 @@ function Invoke-Switch {
     $env:NIX_WIN_STORE_PATH = $build.WinPath
     $activateScript = Join-Path $build.WinPath "activate.ps1"
     if (Test-Path $activateScript) {
-        & $activateScript
+        # Wrap the activation call so a throw doesn't silently skip Save-State
+        # with nothing but a small default PS error block. The failure mode
+        # we're guarding against: activate.ps1 invokes DSC/WinGet/PowerShell
+        # modules, any of which can throw. Before this wrapper, a throw at
+        # that depth produced a generic "ERROR: ..." with no framing, the
+        # script exited, and state.json stayed at the previous generation
+        # with no obvious indication that the generation we just wrote to
+        # disk (gen dir + manifest) was never actually activated.
+        try {
+            & $activateScript
+        } catch {
+            $err = $_
+            Write-Host ""
+            Write-Host "════════════════════════════════════════════════════════════════════" -ForegroundColor Red
+            Write-Host " nix-win: ACTIVATION FAILED" -ForegroundColor Red
+            Write-Host "════════════════════════════════════════════════════════════════════" -ForegroundColor Red
+            Write-Host ""
+            Write-Host "Generation $script:NewGeneration was NOT saved." -ForegroundColor Red
+            Write-Host "Current state remains at generation $($state.currentGeneration)." -ForegroundColor Red
+            Write-Host ""
+            if ($err.InvocationInfo -and $err.InvocationInfo.PositionMessage) {
+                Write-Host "Failed at:" -ForegroundColor Red
+                Write-Host $err.InvocationInfo.PositionMessage -ForegroundColor Yellow
+                Write-Host ""
+            }
+            Write-Host "Error:" -ForegroundColor Red
+            Write-Host "  $($err.Exception.Message)" -ForegroundColor Yellow
+            if ($err.ScriptStackTrace) {
+                Write-Host ""
+                Write-Host "Stack trace:" -ForegroundColor Red
+                Write-Host $err.ScriptStackTrace -ForegroundColor DarkGray
+            }
+            Write-Host ""
+            Write-Host "════════════════════════════════════════════════════════════════════" -ForegroundColor Red
+            # Re-throw so the overall script exits non-zero and any wrapping
+            # script (CI, scheduled task) sees the failure.
+            throw
+        }
     }
 
-    # Update state
+    # Update state — only reached on successful activation
     $newState = @{
         currentGeneration = $script:NewGeneration
         storePath         = $build.StorePath
