@@ -250,6 +250,82 @@ function Deploy-Links {
 
 # ── File Deployment ────────────────────────────────────────────────────────
 
+# Copy a file to a target path, tolerating the case where the destination
+# is currently held open as a mapped image by another process (DLLs loaded
+# by running services, executables of live processes, etc.).
+#
+# The direct overwrite path (Copy-Item -Force) fails with
+# ERROR_SHARING_VIOLATION in that case, because `CreateFile(GENERIC_WRITE)`
+# on the destination conflicts with the loader's existing handle — which
+# was opened without FILE_SHARE_WRITE. See Larry Osterman's 2004 post on
+# FILE_SHARE_DELETE for the loader's actual share set:
+#   https://learn.microsoft.com/en-us/archive/blogs/larryosterman/why-is-it-file_share_read-and-file_share_write-anyway
+#
+# But the loader does grant FILE_SHARE_DELETE, so MoveFile succeeds even
+# while the file is mapped. Fall back to rename-then-copy: move the live
+# file aside to a `.nix-win-stale-<ticks>` name (the existing mapping
+# stays pinned to the underlying file identity, so running processes keep
+# working), then copy the new bytes into the freed path. New processes
+# that LoadLibrary the original path pick up the new bytes; Sweep-StaleFiles
+# cleans up on a later switch once the holder exits.
+#
+# This mirrors the pattern every Windows auto-updater relies on (Chrome,
+# VS Code, Windows Update for user-space DLLs).
+function Copy-FileRobust {
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Destination
+    )
+
+    # Happy path: direct overwrite succeeds unless a live handle pins the
+    # destination without FILE_SHARE_WRITE.
+    try {
+        Copy-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop
+        return
+    } catch [System.IO.IOException] {
+        # Most likely ERROR_SHARING_VIOLATION (win32 32). Fall through.
+    } catch [System.UnauthorizedAccessException] {
+        # Same class of failure; also handled by rename-replace.
+    }
+
+    $stale = "$Destination.nix-win-stale-$([DateTime]::UtcNow.Ticks)"
+    try {
+        [System.IO.File]::Move($Destination, $stale)
+    } catch {
+        throw "nix-win: cannot replace in-use file $Destination ($_)"
+    }
+
+    try {
+        Copy-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop
+    } catch {
+        # Rollback. Use Move() with overwrite so a racing writer at
+        # $Destination doesn't trap the old file in .stale-* limbo.
+        [System.IO.File]::Move($stale, $Destination, $true)
+        throw
+    }
+
+    # Best-effort cleanup. Typically fails the first time because the
+    # holder is still live; Sweep-StaleFiles on the next switch retries
+    # once the holder has exited (e.g. user restarted wezterm-mux-server).
+    try {
+        Remove-Item -LiteralPath $stale -Force -ErrorAction Stop
+    } catch {
+        Write-Host "  (deferred: $stale still in use)" -ForegroundColor DarkYellow
+    }
+}
+
+# Best-effort cleanup of rename-aside markers from prior switches.
+# Called at the top of each root's Deploy-Files pass so orphans don't
+# accumulate across generations once their holders exit.
+function Sweep-StaleFiles {
+    param([string]$Root)
+    if (-not (Test-Path -LiteralPath $Root)) { return }
+    Get-ChildItem -LiteralPath $Root -Recurse -File -Filter '*.nix-win-stale-*' `
+        -ErrorAction SilentlyContinue | ForEach-Object {
+        try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop } catch {}
+    }
+}
+
 function Deploy-Files {
     param(
         [string]$WinStorePath,
@@ -260,6 +336,8 @@ function Deploy-Files {
     $roots = @("home", "appdata-local", "appdata-roaming", "programdata")
 
     foreach ($root in $roots) {
+        Sweep-StaleFiles -Root (Resolve-TargetRoot $root)
+
         $sourceDir = Join-Path $WinStorePath $root
         if (-not (Test-Path $sourceDir)) { continue }
 
@@ -286,7 +364,7 @@ function Deploy-Files {
                 Copy-Item $targetPath (Join-Path $genDir $backupName) -Force
             }
 
-            Copy-Item $file.FullName $targetPath -Force
+            Copy-FileRobust -Source $file.FullName -Destination $targetPath
             $newFiles[$fileKey] = @{ status = "managed" }
             Write-Host "  $relativePath -> $targetPath" -ForegroundColor DarkGray
         }
