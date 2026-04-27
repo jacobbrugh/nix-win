@@ -157,6 +157,17 @@ sys.stdout.buffer.write(z.read('DSCResources/MSFT_WindowsDefender/MSFT_WindowsDe
         ];
     }
     {
+      name = "networking_hostsfile.nix";
+      path = fromMof "networking_hostsfile"
+        "${networkingDscSrc}/source/DSCResources/DSC_HostsFile/DSC_HostsFile.schema.mof"
+        [
+          "--resource-type" "NetworkingDsc/HostsFile"
+          "--mode" "psdsc-wrapper"
+          "--option-path" "win.dsc.hostsFile"
+          "--key-prop" "HostName"
+        ];
+    }
+    {
       name = "registry.nix";
       path = fromDscSource "registry" registrySchema [
         "--schema-json" "--resource-type" "Microsoft.Windows/Registry"

@@ -9,6 +9,7 @@
 
     # NetworkingDsc
     ./networking_firewall.nix
+    ./networking_hostsfile.nix
 
     # ComputerManagementDsc
     ./scheduled_task.nix
