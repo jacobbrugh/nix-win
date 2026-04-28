@@ -4,6 +4,7 @@
 #
 # Upstream sources and pins:
 #   PowerShell/DSC 5ef68a58 (main)              — windows_service, windows_firewall manifests
+#   PowerShell/DSC 9288f0c2 (main, v3.1.0)      — config/document.resource.json (instance schema)
 #   MicrosoftDocs/PowerShell-Docs-DSC 1c661f42b — registry (Microsoft.Windows/Registry) JSON schema
 #   dsccommunity/ComputerManagementDsc v10.0.0   — ScheduledTask MOF
 #   PSGallery WindowsDefender 1.0.0.4 nupkg      — WindowsDefender MOF
@@ -32,6 +33,16 @@ let
   windowsFirewallManifest = pkgs.fetchurl {
     url = "https://raw.githubusercontent.com/PowerShell/DSC/5ef68a58589099da03315a8e6340e3ba0800b164/resources/windows_firewall/windows_firewall.dsc.resource.json";
     hash = "sha256-6saKFrdxVpRJYDz1uhh54jPNuiCc8SXvhnQN6V92fS4=";
+  };
+
+  # PowerShell/DSC commit 9288f0c2 (main) — v3.1.0 `document.resource.json`
+  # JSON schema for one entry in a configuration's `resources:` array. Drives
+  # the generator's emission of framework-level instance fields (`dependsOn`
+  # today; future schema additions like `condition` or `metadata` flow through
+  # automatically when this pin is bumped).
+  dscDocumentResourceSchema = pkgs.fetchurl {
+    url = "https://raw.githubusercontent.com/PowerShell/DSC/9288f0c2200d95e8c9e58153f374d8b8182a33b3/schemas/v3.1.0/config/document.resource.json";
+    hash = "sha256-hefX5nDW85mbbEKNQD9a/V3Q7TJXKCUa5K7wwBSxo1Y=";
   };
 
   # dsccommunity/NetworkingDsc v9.0.0 — DSC_Firewall.schema.mof
@@ -102,12 +113,17 @@ sys.stdout.buffer.write(z.read('DSCResources/MSFT_WindowsDefender/MSFT_WindowsDe
   # Generator helpers
   # ---------------------------------------------------------------------------
 
+  # `--instance-schema` is required for every native and psdsc-wrapper
+  # invocation (container mode ignores it). Threading it through the helpers
+  # rather than each call site keeps the schema pin in one place.
+  instanceSchemaArgs = [ "--instance-schema" "${dscDocumentResourceSchema}" ];
+
   fromDscSource =
     name: src: extraArgs:
     pkgs.runCommand "${name}.nix"
       { nativeBuildInputs = [ pkgs.python3 pkgs.nixfmt ]; }
       ''
-        python3 ${dsc2nix} ${src} ${lib.escapeShellArgs extraArgs} > ./raw.nix
+        python3 ${dsc2nix} ${src} ${lib.escapeShellArgs (instanceSchemaArgs ++ extraArgs)} > ./raw.nix
         nixfmt ./raw.nix
         cp ./raw.nix $out
       '';
@@ -119,7 +135,7 @@ sys.stdout.buffer.write(z.read('DSCResources/MSFT_WindowsDefender/MSFT_WindowsDe
     pkgs.runCommand "${name}.nix"
       { nativeBuildInputs = [ pkgs.python3 pkgs.nixfmt ]; }
       ''
-        python3 ${dsc2nix} --mof ${src} ${lib.escapeShellArgs extraArgs} > ./raw.nix
+        python3 ${dsc2nix} --mof ${src} ${lib.escapeShellArgs (instanceSchemaArgs ++ extraArgs)} > ./raw.nix
         nixfmt ./raw.nix
         cp ./raw.nix $out
       '';

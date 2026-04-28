@@ -136,6 +136,118 @@ def generate_submodule_assignments(properties: dict, skip_props: set | None = No
     return "\n            ".join(lines)
 
 
+def instance_field_to_nix(prop: dict, required: bool) -> tuple[str, str | None, str | None]:
+    """Map a DSC v3 instance-record framework field to a Nix option.
+
+    Returns (type_expr, default, sentinel). `default` and `sentinel` are None
+    for required fields (the option then has no default and is always emitted
+    in the resource record). For optional fields, `sentinel` is the value the
+    emit block compares against to decide whether to include the field.
+    """
+    actual_type = prop.get("type")
+    if isinstance(actual_type, list):
+        actual_type = next((t for t in actual_type if t != "null"), None)
+
+    if actual_type == "array":
+        items = prop.get("items", {})
+        item_nix = {
+            "string": "lib.types.str",
+            "integer": "lib.types.int",
+            "boolean": "lib.types.bool",
+            "number": "(lib.types.either lib.types.int lib.types.float)",
+        }.get(items.get("type", "string"), "lib.types.str")
+        if required:
+            return f"(lib.types.listOf {item_nix})", None, None
+        return f"(lib.types.listOf {item_nix})", "[ ]", "[ ]"
+    if actual_type == "boolean":
+        base = "lib.types.bool"
+    elif actual_type == "integer":
+        base = "lib.types.int"
+    elif actual_type == "number":
+        base = "(lib.types.either lib.types.int lib.types.float)"
+    elif actual_type == "object":
+        base = "lib.types.attrs"
+    else:  # string, datetime, anything unknown
+        base = "lib.types.str"
+    if required:
+        return base, None, None
+    return f"(lib.types.nullOr {base})", "null", "null"
+
+
+# Resource-instance fields the generator already handles itself — these are
+# never surfaced as Nix options on consumer modules:
+#   - `name`     : set from the Nix attrset key (or container_name in container mode)
+#   - `type`     : set from --resource-type / --wrapper-adapter
+#   - `properties`: populated from the per-resource type schema (MOF/JSON)
+INSTANCE_FIELDS_HANDLED_BY_GENERATOR = {"name", "type", "properties"}
+
+
+def parse_instance_schema(content: str) -> list[dict]:
+    """Parse a DSC v3 `document.resource.json` schema and return the list of
+    author-settable framework fields (those that should appear as Nix options
+    on every generated module and be threaded into the emitted resource record).
+
+    Skips fields the generator handles itself — see
+    INSTANCE_FIELDS_HANDLED_BY_GENERATOR.
+    """
+    schema = json.loads(content)
+    required_set = set(schema.get("required", []))
+    out: list[dict] = []
+    for fname, fschema in schema.get("properties", {}).items():
+        if fname in INSTANCE_FIELDS_HANDLED_BY_GENERATOR:
+            continue
+        is_required = fname in required_set
+        type_expr, default, sentinel = instance_field_to_nix(fschema, is_required)
+        desc = fschema.get("description") or fschema.get("title") or ""
+        desc = re.sub(r"\s+", " ", desc).strip()
+        if len(desc) > 400:
+            desc = desc[:397] + "..."
+        out.append({
+            "name": fname,
+            "type_expr": type_expr,
+            "default": default,
+            "sentinel": sentinel,
+            "description": desc,
+        })
+    return out
+
+
+def render_framework_options(fields: list[dict], leading_indent: str) -> str:
+    """Render Nix option declarations for framework instance fields, joined to
+    sit inside the per-resource submodule's `options = { ... }` block."""
+    if not fields:
+        return ""
+    lines: list[str] = []
+    for f in fields:
+        lines.append(f'{leading_indent}{f["name"]} = lib.mkOption {{')
+        lines.append(f'{leading_indent}  type = {f["type_expr"]};')
+        if f["default"] is not None:
+            lines.append(f'{leading_indent}  default = {f["default"]};')
+        lines.append(f'{leading_indent}  description = "{escape_nix(f["description"])}";')
+        lines.append(f'{leading_indent}}};')
+    return "\n".join(lines)
+
+
+def render_framework_threads(fields: list[dict], indent: str) -> str:
+    """Render the `// (lib.optionalAttrs ...)` lines that thread framework
+    fields onto the emitted resource record. One line per field."""
+    if not fields:
+        return ""
+    lines: list[str] = []
+    for f in fields:
+        if f["sentinel"] is None:
+            # Required: always emit. (No DSC v3 instance field is currently
+            # required besides `name` and `type` which the generator handles
+            # itself, but keep the branch for forward compatibility.)
+            lines.append(f'{indent}// {{ inherit (props) {f["name"]}; }}')
+        else:
+            lines.append(
+                f'{indent}// (lib.optionalAttrs (props.{f["name"]} != {f["sentinel"]}) '
+                f'{{ inherit (props) {f["name"]}; }})'
+            )
+    return "\n".join(lines)
+
+
 def parse_mof_schema(content: str) -> dict:
     """Parse a DSC .schema.mof file and return a JSON schema dict.
 
@@ -330,6 +442,25 @@ def generate_module(args) -> str:
     inherit_str = generate_inherit_list(work_properties, skip_props=skip_props)
     submodule_str = generate_submodule_assignments(work_properties, skip_props=skip_props)
 
+    # Framework-level instance fields: parsed from the DSC v3
+    # `document.resource.json` schema and surfaced as Nix options on every
+    # generated module (native + psdsc-wrapper). Container mode emits a
+    # single aggregated resource; framework fields would be ambiguous at
+    # the per-item level and are not supported there.
+    framework_fields: list[dict] = []
+    if mode in ("native", "psdsc-wrapper"):
+        if not args.instance_schema:
+            raise ValueError(
+                f"--instance-schema is required for mode={mode}; without it, "
+                "the generator can't surface DSC v3 framework-level fields "
+                "(dependsOn, etc.) on the emitted resource record."
+            )
+        framework_fields = parse_instance_schema(Path(args.instance_schema).read_text())
+
+    framework_options_str = render_framework_options(framework_fields, "        ")
+    if framework_options_str:
+        options_str = options_str + "\n" + framework_options_str if options_str else framework_options_str
+
     source_note = Path(args.source).name
     regen_cmd = "nix build .#packages.x86_64-linux.generate-dsc-modules"
 
@@ -344,15 +475,20 @@ def generate_module(args) -> str:
 
     if mode == "native":
         props = _props_block()
+        threads = render_framework_threads(framework_fields, "      ")
+        threads_block = f"\n{threads}" if threads else ""
         config_block = f'''\
   config.win.dsc.nativeResourcesList = lib.mkIf cfg.enable (
-    lib.mapAttrsToList (rname: props: {{
-      name = rname;
-      type = "{resource_type}";
-      properties = lib.filterAttrs (_: v: v != null) {{
-        {props}
-      }};
-    }}) {cfg_attr}
+    lib.mapAttrsToList (
+      rname: props:
+      {{
+        name = rname;
+        type = "{resource_type}";
+        properties = lib.filterAttrs (_: v: v != null) {{
+          {props}
+        }};
+      }}{threads_block}
+    ) {cfg_attr}
   );'''
 
     elif mode == "psdsc-wrapper":
@@ -360,24 +496,31 @@ def generate_module(args) -> str:
         inner_type = args.wrapper_inner_type or resource_type
         key_inject = f'\n            {key_prop} = rname;' if key_prop else ""
         props = _props_block("    ")
+        threads = render_framework_threads(framework_fields, "      ")
+        threads_block = f"\n{threads}" if threads else ""
         config_block = f'''\
   config.win.dsc.nativeResourcesList = lib.mkIf cfg.enable (
-    lib.mapAttrsToList (rname: props: {{
-      name = rname;
-      type = "{adapter}";
-      properties.resources = [
-        {{
-          name = "${{rname}} Inner";
-          type = "{inner_type}";
-          properties = lib.filterAttrs (_: v: v != null) {{{key_inject}
-            {props}
-          }};
-        }}
-      ];
-    }}) {cfg_attr}
+    lib.mapAttrsToList (
+      rname: props:
+      {{
+        name = rname;
+        type = "{adapter}";
+        properties.resources = [
+          {{
+            name = "${{rname}} Inner";
+            type = "{inner_type}";
+            properties = lib.filterAttrs (_: v: v != null) {{{key_inject}
+              {props}
+            }};
+          }}
+        ];
+      }}{threads_block}
+    ) {cfg_attr}
   );'''
 
     elif mode == "container":
+        # Framework fields not surfaced in container mode — see the
+        # `framework_fields` initialization above.
         container_name = args.container_name or f"{resource_type} Config"
         config_block = f'''\
   config.win.dsc.nativeResourcesList = lib.mkIf (cfg.enable && {cfg_attr} != {{ }}) [
@@ -435,6 +578,15 @@ def main():
     parser.add_argument("--container-name", help="DSC resource name for container mode")
     parser.add_argument("--option-path", help="Override Nix option path (dot-separated)")
     parser.add_argument("--key-prop", help="Property auto-set from attrset key (excluded from options)")
+    parser.add_argument(
+        "--instance-schema",
+        help=(
+            "Path to a DSC v3 `document.resource.json` schema. Author-settable "
+            "framework-level fields (e.g. `dependsOn`) are surfaced as Nix "
+            "options and threaded into the emitted resource record. Required "
+            "for native and psdsc-wrapper modes; ignored in container mode."
+        ),
+    )
     args = parser.parse_args()
 
     print(generate_module(args), end="")
