@@ -511,6 +511,11 @@ in
             default = null;
             description = "Configure Attack Surface Reduction Rule(ASR) actions. The actions need to be in the same order as their respective rule Ids specified in the AttackSurfaceReductionRules_Ids property.";
           };
+          dependsOn = lib.mkOption {
+            type = (lib.types.listOf lib.types.str);
+            default = [ ];
+            description = "Defines a list of DSC resource instances that DSC must successfully process before processing this instance. Each value for this property must be the `resourceID()` lookup for another instance in the configuration. Multiple instances can depend on the same instance, but every dependency for an instance must be unique in that instance's `dependsOn` property.";
+          };
         };
       }
     );
@@ -519,83 +524,87 @@ in
   };
 
   config.win.dsc.nativeResourcesList = lib.mkIf cfg.enable (
-    lib.mapAttrsToList (rname: props: {
-      name = rname;
-      type = "Microsoft.Windows/WindowsPowerShell";
-      properties.resources = [
-        {
-          name = "${rname} Inner";
-          type = "WindowsDefender/WindowsDefender";
-          properties = lib.filterAttrs (_: v: v != null) {
-            IsSingleInstance = rname;
-            inherit (props)
-              ExclusionPath
-              ExclusionExtension
-              ExclusionProcess
-              RealTimeScanDirection
-              QuarantinePurgeItemsAfterDelay
-              RemediationScheduleDay
-              RemediationScheduleTime
-              ReportingAdditionalActionTimeOut
-              ReportingNonCriticalTimeOut
-              ReportingCriticalFailureTimeOut
-              ScanAvgCPULoadFactor
-              CheckForSignaturesBeforeRunningScan
-              ScanPurgeItemsAfterDelay
-              ScanOnlyIfIdleEnabled
-              ScanParameters
-              ScanScheduleDay
-              ScanScheduleQuickScanTime
-              ScanScheduleTime
-              SignatureFirstAuGracePeriod
-              SignatureAuGracePeriod
-              SignatureDefinitionUpdateFileSharesSources
-              SignatureDisableUpdateOnStartupWithoutEngine
-              SignatureFallbackOrder
-              SignatureScheduleDay
-              SignatureScheduleTime
-              SignatureUpdateCatchupInterval
-              SignatureUpdateInterval
-              MAPSReporting
-              DisablePrivacyMode
-              RandomizeScheduleTaskTimes
-              DisableBehaviorMonitoring
-              DisableIntrusionPreventionSystem
-              DisableIOAVProtection
-              DisableRealtimeMonitoring
-              DisableScriptScanning
-              DisableArchiveScanning
-              DisableAutoExclusions
-              DisableCatchupFullScan
-              DisableCatchupQuickScan
-              DisableEmailScanning
-              DisableRemovableDriveScanning
-              DisableRestorePoint
-              DisableScanningMappedNetworkDrivesForFullScan
-              DisableScanningNetworkFiles
-              UILockdown
-              ThreatIDDefaultAction_Ids
-              ThreatIDDefaultAction_Actions
-              UnknownThreatDefaultAction
-              LowThreatDefaultAction
-              ModerateThreatDefaultAction
-              HighThreatDefaultAction
-              SevereThreatDefaultAction
-              SubmitSamplesConsent
-              DisableBlockAtFirstSeen
-              CloudBlockLevel
-              CloudExtendedTimeout
-              EnableNetworkProtection
-              EnableControlledFolderAccess
-              AttackSurfaceReductionOnlyExclusions
-              ControlledFolderAccessAllowedApplications
-              ControlledFolderAccessProtectedFolders
-              AttackSurfaceReductionRules_Ids
-              AttackSurfaceReductionRules_Actions
-              ;
-          };
-        }
-      ];
-    }) cfg.defender
+    lib.mapAttrsToList (
+      rname: props:
+      {
+        name = rname;
+        type = "Microsoft.Windows/WindowsPowerShell";
+        properties.resources = [
+          {
+            name = "${rname} Inner";
+            type = "WindowsDefender/WindowsDefender";
+            properties = lib.filterAttrs (_: v: v != null) {
+              IsSingleInstance = rname;
+              inherit (props)
+                ExclusionPath
+                ExclusionExtension
+                ExclusionProcess
+                RealTimeScanDirection
+                QuarantinePurgeItemsAfterDelay
+                RemediationScheduleDay
+                RemediationScheduleTime
+                ReportingAdditionalActionTimeOut
+                ReportingNonCriticalTimeOut
+                ReportingCriticalFailureTimeOut
+                ScanAvgCPULoadFactor
+                CheckForSignaturesBeforeRunningScan
+                ScanPurgeItemsAfterDelay
+                ScanOnlyIfIdleEnabled
+                ScanParameters
+                ScanScheduleDay
+                ScanScheduleQuickScanTime
+                ScanScheduleTime
+                SignatureFirstAuGracePeriod
+                SignatureAuGracePeriod
+                SignatureDefinitionUpdateFileSharesSources
+                SignatureDisableUpdateOnStartupWithoutEngine
+                SignatureFallbackOrder
+                SignatureScheduleDay
+                SignatureScheduleTime
+                SignatureUpdateCatchupInterval
+                SignatureUpdateInterval
+                MAPSReporting
+                DisablePrivacyMode
+                RandomizeScheduleTaskTimes
+                DisableBehaviorMonitoring
+                DisableIntrusionPreventionSystem
+                DisableIOAVProtection
+                DisableRealtimeMonitoring
+                DisableScriptScanning
+                DisableArchiveScanning
+                DisableAutoExclusions
+                DisableCatchupFullScan
+                DisableCatchupQuickScan
+                DisableEmailScanning
+                DisableRemovableDriveScanning
+                DisableRestorePoint
+                DisableScanningMappedNetworkDrivesForFullScan
+                DisableScanningNetworkFiles
+                UILockdown
+                ThreatIDDefaultAction_Ids
+                ThreatIDDefaultAction_Actions
+                UnknownThreatDefaultAction
+                LowThreatDefaultAction
+                ModerateThreatDefaultAction
+                HighThreatDefaultAction
+                SevereThreatDefaultAction
+                SubmitSamplesConsent
+                DisableBlockAtFirstSeen
+                CloudBlockLevel
+                CloudExtendedTimeout
+                EnableNetworkProtection
+                EnableControlledFolderAccess
+                AttackSurfaceReductionOnlyExclusions
+                ControlledFolderAccessAllowedApplications
+                ControlledFolderAccessProtectedFolders
+                AttackSurfaceReductionRules_Ids
+                AttackSurfaceReductionRules_Actions
+                ;
+            };
+          }
+        ];
+      }
+      // (lib.optionalAttrs (props.dependsOn != [ ]) { inherit (props) dependsOn; })
+    ) cfg.defender
   );
 }

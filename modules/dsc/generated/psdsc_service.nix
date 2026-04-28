@@ -122,6 +122,11 @@ in
             default = null;
             description = "The time to wait for the service to stop in milliseconds. Defaults to 30000.";
           };
+          dependsOn = lib.mkOption {
+            type = (lib.types.listOf lib.types.str);
+            default = [ ];
+            description = "Defines a list of DSC resource instances that DSC must successfully process before processing this instance. Each value for this property must be the `resourceID()` lookup for another instance in the configuration. Multiple instances can depend on the same instance, but every dependency for an instance must be unique in that instance's `dependsOn` property.";
+          };
         };
       }
     );
@@ -130,33 +135,37 @@ in
   };
 
   config.win.dsc.nativeResourcesList = lib.mkIf cfg.enable (
-    lib.mapAttrsToList (rname: props: {
-      name = rname;
-      type = "Microsoft.Windows/WindowsPowerShell";
-      properties.resources = [
-        {
-          name = "${rname} Inner";
-          type = "PSDesiredStateConfiguration/Service";
-          properties = lib.filterAttrs (_: v: v != null) {
-            Name = rname;
-            inherit (props)
-              Ensure
-              Path
-              StartupType
-              BuiltInAccount
-              DesktopInteract
-              State
-              DisplayName
-              Description
-              Dependencies
-              StartupTimeout
-              TerminateTimeout
-              ;
-            Credential =
-              if props.Credential != null then lib.filterAttrs (_: v: v != null) props.Credential else null;
-          };
-        }
-      ];
-    }) cfg.psdsc.service
+    lib.mapAttrsToList (
+      rname: props:
+      {
+        name = rname;
+        type = "Microsoft.Windows/WindowsPowerShell";
+        properties.resources = [
+          {
+            name = "${rname} Inner";
+            type = "PSDesiredStateConfiguration/Service";
+            properties = lib.filterAttrs (_: v: v != null) {
+              Name = rname;
+              inherit (props)
+                Ensure
+                Path
+                StartupType
+                BuiltInAccount
+                DesktopInteract
+                State
+                DisplayName
+                Description
+                Dependencies
+                StartupTimeout
+                TerminateTimeout
+                ;
+              Credential =
+                if props.Credential != null then lib.filterAttrs (_: v: v != null) props.Credential else null;
+            };
+          }
+        ];
+      }
+      // (lib.optionalAttrs (props.dependsOn != [ ]) { inherit (props) dependsOn; })
+    ) cfg.psdsc.service
   );
 }

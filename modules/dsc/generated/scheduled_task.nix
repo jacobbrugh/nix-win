@@ -354,6 +354,11 @@ in
             default = null;
             description = "Specifies the kind of session state change that would trigger a task launch. Can only be used in combination with ScheduleType OnSessionState.";
           };
+          dependsOn = lib.mkOption {
+            type = (lib.types.listOf lib.types.str);
+            default = [ ];
+            description = "Defines a list of DSC resource instances that DSC must successfully process before processing this instance. Each value for this property must be the `resourceID()` lookup for another instance in the configuration. Multiple instances can depend on the same instance, but every dependency for an instance must be unique in that instance's `dependsOn` property.";
+          };
         };
       }
     );
@@ -362,73 +367,77 @@ in
   };
 
   config.win.dsc.nativeResourcesList = lib.mkIf cfg.enable (
-    lib.mapAttrsToList (rname: props: {
-      name = rname;
-      type = "Microsoft.Windows/WindowsPowerShell";
-      properties.resources = [
-        {
-          name = "${rname} Inner";
-          type = "ComputerManagementDsc/ScheduledTask";
-          properties = lib.filterAttrs (_: v: v != null) {
-            TaskName = rname;
-            inherit (props)
-              TaskPath
-              Description
-              ActionExecutable
-              ActionArguments
-              ActionWorkingPath
-              ScheduleType
-              RepeatInterval
-              StartTime
-              SynchronizeAcrossTimeZone
-              Ensure
-              Enable
-              BuiltInAccount
-              ExecuteAsGMSA
-              DaysInterval
-              RandomDelay
-              RepetitionDuration
-              StopAtDurationEnd
-              TriggerExecutionTimeLimit
-              DaysOfWeek
-              WeeksInterval
-              User
-              DisallowDemandStart
-              DisallowHardTerminate
-              Compatibility
-              AllowStartIfOnBatteries
-              Hidden
-              RunOnlyIfIdle
-              IdleWaitTimeout
-              NetworkName
-              DisallowStartOnRemoteAppSession
-              StartWhenAvailable
-              DontStopIfGoingOnBatteries
-              WakeToRun
-              IdleDuration
-              RestartOnIdle
-              DontStopOnIdleEnd
-              ExecutionTimeLimit
-              MultipleInstances
-              Priority
-              RestartCount
-              RestartInterval
-              RunOnlyIfNetworkAvailable
-              RunLevel
-              LogonType
-              EventSubscription
-              EventValueQueries
-              Delay
-              StateChange
-              ;
-            ExecuteAsCredential =
-              if props.ExecuteAsCredential != null then
-                lib.filterAttrs (_: v: v != null) props.ExecuteAsCredential
-              else
-                null;
-          };
-        }
-      ];
-    }) cfg.scheduledTasks
+    lib.mapAttrsToList (
+      rname: props:
+      {
+        name = rname;
+        type = "Microsoft.Windows/WindowsPowerShell";
+        properties.resources = [
+          {
+            name = "${rname} Inner";
+            type = "ComputerManagementDsc/ScheduledTask";
+            properties = lib.filterAttrs (_: v: v != null) {
+              TaskName = rname;
+              inherit (props)
+                TaskPath
+                Description
+                ActionExecutable
+                ActionArguments
+                ActionWorkingPath
+                ScheduleType
+                RepeatInterval
+                StartTime
+                SynchronizeAcrossTimeZone
+                Ensure
+                Enable
+                BuiltInAccount
+                ExecuteAsGMSA
+                DaysInterval
+                RandomDelay
+                RepetitionDuration
+                StopAtDurationEnd
+                TriggerExecutionTimeLimit
+                DaysOfWeek
+                WeeksInterval
+                User
+                DisallowDemandStart
+                DisallowHardTerminate
+                Compatibility
+                AllowStartIfOnBatteries
+                Hidden
+                RunOnlyIfIdle
+                IdleWaitTimeout
+                NetworkName
+                DisallowStartOnRemoteAppSession
+                StartWhenAvailable
+                DontStopIfGoingOnBatteries
+                WakeToRun
+                IdleDuration
+                RestartOnIdle
+                DontStopOnIdleEnd
+                ExecutionTimeLimit
+                MultipleInstances
+                Priority
+                RestartCount
+                RestartInterval
+                RunOnlyIfNetworkAvailable
+                RunLevel
+                LogonType
+                EventSubscription
+                EventValueQueries
+                Delay
+                StateChange
+                ;
+              ExecuteAsCredential =
+                if props.ExecuteAsCredential != null then
+                  lib.filterAttrs (_: v: v != null) props.ExecuteAsCredential
+                else
+                  null;
+            };
+          }
+        ];
+      }
+      // (lib.optionalAttrs (props.dependsOn != [ ]) { inherit (props) dependsOn; })
+    ) cfg.scheduledTasks
   );
 }

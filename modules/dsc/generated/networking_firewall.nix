@@ -243,6 +243,11 @@ in
             default = null;
             description = "Specifies that matching firewall rules of the indicated owner are created.";
           };
+          dependsOn = lib.mkOption {
+            type = (lib.types.listOf lib.types.str);
+            default = [ ];
+            description = "Defines a list of DSC resource instances that DSC must successfully process before processing this instance. Each value for this property must be the `resourceID()` lookup for another instance in the configuration. Multiple instances can depend on the same instance, but every dependency for an instance must be unique in that instance's `dependsOn` property.";
+          };
         };
       }
     );
@@ -251,51 +256,55 @@ in
   };
 
   config.win.dsc.nativeResourcesList = lib.mkIf cfg.enable (
-    lib.mapAttrsToList (rname: props: {
-      name = rname;
-      type = "Microsoft.Windows/WindowsPowerShell";
-      properties.resources = [
-        {
-          name = "${rname} Inner";
-          type = "NetworkingDsc/Firewall";
-          properties = lib.filterAttrs (_: v: v != null) {
-            Name = rname;
-            inherit (props)
-              DisplayName
-              Group
-              Ensure
-              Enabled
-              Action
-              Profile
-              Direction
-              RemotePort
-              LocalPort
-              Protocol
-              Description
-              Program
-              Service
-              Authentication
-              Encryption
-              InterfaceAlias
-              InterfaceType
-              LocalAddress
-              LocalUser
-              Package
-              Platform
-              RemoteAddress
-              RemoteMachine
-              RemoteUser
-              DynamicTransport
-              EdgeTraversalPolicy
-              IcmpType
-              LocalOnlyMapping
-              LooseSourceMapping
-              OverrideBlockRules
-              Owner
-              ;
-          };
-        }
-      ];
-    }) cfg.firewall.rules
+    lib.mapAttrsToList (
+      rname: props:
+      {
+        name = rname;
+        type = "Microsoft.Windows/WindowsPowerShell";
+        properties.resources = [
+          {
+            name = "${rname} Inner";
+            type = "NetworkingDsc/Firewall";
+            properties = lib.filterAttrs (_: v: v != null) {
+              Name = rname;
+              inherit (props)
+                DisplayName
+                Group
+                Ensure
+                Enabled
+                Action
+                Profile
+                Direction
+                RemotePort
+                LocalPort
+                Protocol
+                Description
+                Program
+                Service
+                Authentication
+                Encryption
+                InterfaceAlias
+                InterfaceType
+                LocalAddress
+                LocalUser
+                Package
+                Platform
+                RemoteAddress
+                RemoteMachine
+                RemoteUser
+                DynamicTransport
+                EdgeTraversalPolicy
+                IcmpType
+                LocalOnlyMapping
+                LooseSourceMapping
+                OverrideBlockRules
+                Owner
+                ;
+            };
+          }
+        ];
+      }
+      // (lib.optionalAttrs (props.dependsOn != [ ]) { inherit (props) dependsOn; })
+    ) cfg.firewall.rules
   );
 }

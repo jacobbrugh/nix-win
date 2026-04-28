@@ -22,13 +22,14 @@ in
             type = (
               lib.types.nullOr (
                 lib.types.enum [
-                  "Present"
+                  "File"
+                  "Directory"
                   "Absent"
                 ]
               )
             );
             default = null;
-            description = "Whether the file or directory should exist.";
+            description = "Defines how to evaluate the existents of the destination file.";
           };
           SourcePath = lib.mkOption {
             type = (lib.types.nullOr lib.types.str);
@@ -91,6 +92,11 @@ in
             default = null;
             description = "Attributes for file / directory";
           };
+          dependsOn = lib.mkOption {
+            type = (lib.types.listOf lib.types.str);
+            default = [ ];
+            description = "Defines a list of DSC resource instances that DSC must successfully process before processing this instance. Each value for this property must be the `resourceID()` lookup for another instance in the configuration. Multiple instances can depend on the same instance, but every dependency for an instance must be unique in that instance's `dependsOn` property.";
+          };
         };
       }
     );
@@ -99,29 +105,33 @@ in
   };
 
   config.win.dsc.nativeResourcesList = lib.mkIf cfg.enable (
-    lib.mapAttrsToList (rname: props: {
-      name = rname;
-      type = "Microsoft.Windows/WindowsPowerShell";
-      properties.resources = [
-        {
-          name = "${rname} Inner";
-          type = "PSDesiredStateConfiguration/File";
-          properties = lib.filterAttrs (_: v: v != null) {
-            inherit (props)
-              DestinationPath
-              Ensure
-              SourcePath
-              Contents
-              Checksum
-              SecurityDescriptor
-              Recurs
-              Purge
-              credential
-              Attributes
-              ;
-          };
-        }
-      ];
-    }) cfg.psdsc.file
+    lib.mapAttrsToList (
+      rname: props:
+      {
+        name = rname;
+        type = "Microsoft.Windows/WindowsPowerShell";
+        properties.resources = [
+          {
+            name = "${rname} Inner";
+            type = "PSDesiredStateConfiguration/File";
+            properties = lib.filterAttrs (_: v: v != null) {
+              inherit (props)
+                DestinationPath
+                Ensure
+                SourcePath
+                Contents
+                Checksum
+                SecurityDescriptor
+                Recurs
+                Purge
+                credential
+                Attributes
+                ;
+            };
+          }
+        ];
+      }
+      // (lib.optionalAttrs (props.dependsOn != [ ]) { inherit (props) dependsOn; })
+    ) cfg.psdsc.file
   );
 }

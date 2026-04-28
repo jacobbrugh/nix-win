@@ -78,6 +78,11 @@ in
             default = null;
             description = "Value used to set whether a user can/cannot change their password";
           };
+          dependsOn = lib.mkOption {
+            type = (lib.types.listOf lib.types.str);
+            default = [ ];
+            description = "Defines a list of DSC resource instances that DSC must successfully process before processing this instance. Each value for this property must be the `resourceID()` lookup for another instance in the configuration. Multiple instances can depend on the same instance, but every dependency for an instance must be unique in that instance's `dependsOn` property.";
+          };
         };
       }
     );
@@ -86,29 +91,33 @@ in
   };
 
   config.win.dsc.nativeResourcesList = lib.mkIf cfg.enable (
-    lib.mapAttrsToList (rname: props: {
-      name = rname;
-      type = "Microsoft.Windows/WindowsPowerShell";
-      properties.resources = [
-        {
-          name = "${rname} Inner";
-          type = "PSDesiredStateConfiguration/User";
-          properties = lib.filterAttrs (_: v: v != null) {
-            UserName = rname;
-            inherit (props)
-              Ensure
-              FullName
-              Description
-              Disabled
-              PasswordNeverExpires
-              PasswordChangeRequired
-              PasswordChangeNotAllowed
-              ;
-            Password =
-              if props.Password != null then lib.filterAttrs (_: v: v != null) props.Password else null;
-          };
-        }
-      ];
-    }) cfg.psdsc.user
+    lib.mapAttrsToList (
+      rname: props:
+      {
+        name = rname;
+        type = "Microsoft.Windows/WindowsPowerShell";
+        properties.resources = [
+          {
+            name = "${rname} Inner";
+            type = "PSDesiredStateConfiguration/User";
+            properties = lib.filterAttrs (_: v: v != null) {
+              UserName = rname;
+              inherit (props)
+                Ensure
+                FullName
+                Description
+                Disabled
+                PasswordNeverExpires
+                PasswordChangeRequired
+                PasswordChangeNotAllowed
+                ;
+              Password =
+                if props.Password != null then lib.filterAttrs (_: v: v != null) props.Password else null;
+            };
+          }
+        ];
+      }
+      // (lib.optionalAttrs (props.dependsOn != [ ]) { inherit (props) dependsOn; })
+    ) cfg.psdsc.user
   );
 }
