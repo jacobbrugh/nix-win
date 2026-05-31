@@ -72,6 +72,11 @@ let
     CC_x86_64_pc_windows_gnu = "${targetPrefix}gcc";
     CXX_x86_64_pc_windows_gnu = "${targetPrefix}g++";
     AR_x86_64_pc_windows_gnu = "${targetPrefix}ar";
+    # openssl-src archives vendored OpenSSL then runs RANLIB on it; it reads
+    # RANLIB_<target> and otherwise falls back to the host `ranlib`, which writes
+    # an index MinGW ld can't read (`libcrypto.a: archive has no index`). Point it
+    # at the MinGW ranlib so the index is in the target format.
+    RANLIB_x86_64_pc_windows_gnu = "${targetPrefix}ranlib";
     # windows.pthreads/mcfgthreads are TARGET-only libs. In a native stdenv,
     # putting them in buildInputs leaks their headers into the single
     # NIX_CFLAGS_COMPILE that host cc invocations also read, so a host build dep
