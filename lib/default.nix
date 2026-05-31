@@ -104,5 +104,5 @@ in
     adminRoots
     isAdminRoot
     ;
-  inherit (windowsRust) buildWindowsRustPackage buildWindowsCranePackage;
+  inherit (windowsRust) buildWindowsRustPackage buildWindowsCraneDepsOnly buildWindowsCranePackage;
 }
