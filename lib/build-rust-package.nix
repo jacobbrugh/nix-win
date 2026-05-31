@@ -132,6 +132,22 @@ let
       }
     );
 
+  # Mirrors crane's `craneLib.buildDepsOnly`: compiles the third-party crate
+  # closure for the Windows target. crane builds this against a stubbed dummy
+  # source tree, so pass only deps-relevant args here — src/dummySrc,
+  # cargoExtraArgs, prePatch — and NOT package-only phases like a postPatch that
+  # edits real workspace files. Feed the result to buildWindowsCranePackage's
+  # `cargoArtifacts`, exactly as you'd pair craneLib.buildDepsOnly with
+  # craneLib.buildPackage.
+  buildWindowsCraneDepsOnly =
+    { craneLib, ... }@args:
+    craneLib.buildDepsOnly (applyWindowsCross (builtins.removeAttrs args [ "craneLib" ]));
+
+  # Mirrors crane's `craneLib.buildPackage`: builds the package with the
+  # caller-supplied windows-targeted `craneLib`. As in crane, `cargoArtifacts`
+  # is optional and defaults to a buildDepsOnly over the same args — so when the
+  # package args carry phases the deps build must not run, build the deps layer
+  # with buildWindowsCraneDepsOnly and pass it in explicitly.
   buildWindowsCranePackage =
     {
       craneLib,
@@ -150,5 +166,5 @@ let
     craneLib.buildPackage (base // { cargoArtifacts = deps; });
 in
 {
-  inherit buildWindowsRustPackage buildWindowsCranePackage;
+  inherit buildWindowsRustPackage buildWindowsCraneDepsOnly buildWindowsCranePackage;
 }
