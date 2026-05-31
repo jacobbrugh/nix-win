@@ -72,9 +72,26 @@ let
     CC_x86_64_pc_windows_gnu = "${targetPrefix}gcc";
     CXX_x86_64_pc_windows_gnu = "${targetPrefix}g++";
     AR_x86_64_pc_windows_gnu = "${targetPrefix}ar";
+    # windows.pthreads/mcfgthreads are TARGET-only libs. In a native stdenv,
+    # putting them in buildInputs leaks their headers into the single
+    # NIX_CFLAGS_COMPILE that host cc invocations also read, so a host build dep
+    # (e.g. libgit2-sys via a build.rs) picks up MinGW pthread.h and fails with
+    # glibc type conflicts. Scope them to the target instead: headers via the
+    # cc-rs CFLAGS_<target>, libs via the target RUSTFLAGS `-L` below.
+    CFLAGS_x86_64_pc_windows_gnu = "-I${crossPkgs.windows.pthreads}/include -I${crossPkgs.windows.mcfgthreads}/include";
+    CXXFLAGS_x86_64_pc_windows_gnu = "-I${crossPkgs.windows.pthreads}/include -I${crossPkgs.windows.mcfgthreads}/include";
   };
 
-  defaultRustflags = "-C link-arg=-lmcfgthread";
+  # `-L` the MinGW thread libs onto the TARGET link only (not buildInputs, which
+  # would leak to host compiles). mcfgthreads: nixpkgs builds its mingw-w64
+  # toolchain with the `mcf` thread model, so `libgcc_eh.a` (linked into any Rust
+  # binary that unwinds — i.e. all of them) references `_MCF_*` symbols only
+  # libmcfgthread provides; without `-lmcfgthread` the final link fails with
+  # screen-fulls of `undefined reference to _MCF_tls_key_new` etc.
+  defaultRustflags =
+    "-L native=${crossPkgs.windows.pthreads}/lib "
+    + "-L native=${crossPkgs.windows.mcfgthreads}/lib "
+    + "-C link-arg=-lmcfgthread";
 
   # Fold the Windows cross config into a caller's args attrset. Lists and
   # RUSTFLAGS are merged (not clobbered) so callers can extend them — e.g.
@@ -104,16 +121,10 @@ let
         pkgs.pkg-config
       ];
 
-      buildInputs = (args.buildInputs or [ ]) ++ [
-        crossPkgs.windows.pthreads
-        # nixpkgs builds its mingw-w64 toolchain with the `mcf` thread
-        # model, so `libgcc_eh.a` (linked into any Rust binary that
-        # unwinds — i.e. all of them) references `_MCF_*` symbols that
-        # only libmcfgthread provides. Without it every non-trivial
-        # cross-build fails at the final link with screen-fulls of
-        # `undefined reference to _MCF_tls_key_new` etc.
-        crossPkgs.windows.mcfgthreads
-      ];
+      # No windows.pthreads/mcfgthreads here — they are TARGET-only and would
+      # leak to host compiles (see crossEnv above); they reach the target via
+      # CFLAGS_<target> (headers) and the `-L` in defaultRustflags (libs).
+      buildInputs = args.buildInputs or [ ];
 
       env =
         crossEnv
