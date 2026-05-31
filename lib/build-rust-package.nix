@@ -63,6 +63,15 @@ let
     CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = "${targetPrefix}gcc";
     WINDRES = "${targetPrefix}windres";
     HOST_CC = "${pkgs.stdenv.cc}/bin/cc";
+    # The cc-rs crate (libz-sys, openssl-src, …) compiles C for the TARGET and
+    # picks its compiler from CC_<target>/CXX_<target>/AR_<target>. nixpkgs'
+    # cross stdenv would export these, but crane builds on the native stdenv, so
+    # without them cc-rs falls back to the host `gcc` and target C fails (e.g.
+    # zlib: `implicit declaration of 'write'` because there's no unistd.h on
+    # Windows). Point them at the MinGW cross toolchain.
+    CC_x86_64_pc_windows_gnu = "${targetPrefix}gcc";
+    CXX_x86_64_pc_windows_gnu = "${targetPrefix}g++";
+    AR_x86_64_pc_windows_gnu = "${targetPrefix}ar";
   };
 
   defaultRustflags = "-C link-arg=-lmcfgthread";
