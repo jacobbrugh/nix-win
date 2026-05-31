@@ -88,8 +88,10 @@ let
 
   isAdminRoot = root: builtins.elem root adminRoots;
 
-  # Rust cross-compile helper — see lib/build-rust-package.nix for details.
-  buildWindowsRustPackage = import ./build-rust-package.nix { inherit pkgs; };
+  # Rust cross-compile builders — see lib/build-rust-package.nix for details.
+  # Exposes both buildWindowsRustPackage (buildRustPackage-style) and
+  # buildWindowsCranePackage (crane-style).
+  windowsRust = import ./build-rust-package.nix { inherit pkgs; };
 
 in
 {
@@ -101,6 +103,6 @@ in
     targetRoots
     adminRoots
     isAdminRoot
-    buildWindowsRustPackage
     ;
+  inherit (windowsRust) buildWindowsRustPackage buildWindowsCranePackage;
 }
