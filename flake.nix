@@ -51,7 +51,7 @@
           winLib = import ./lib { inherit lib pkgs; };
         in
         {
-          inherit (winLib) buildWindowsRustPackage;
+          inherit (winLib) buildWindowsRustPackage buildWindowsCranePackage;
         }
       );
 
