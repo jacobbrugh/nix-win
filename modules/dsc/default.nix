@@ -74,7 +74,14 @@ in
             # ~125 spurious warnings. We don't use any PowerToys DSC resources.
             $prevPath = $env:PATH
             $env:PATH = ($env:PATH -split ';' | Where-Object { $_ -notlike '*PowerToys*DSCModules*' }) -join ';'
-            dsc config set --file $dscConfig
+            # Pipe an empty string so dsc (and the psDscAdapter it spawns, which
+            # inherits dsc's stdin) gets an immediate EOF instead of blocking on
+            # an inherited open-pipe console stdin. Without this, launching the
+            # switch with a never-closing stdin (e.g. `ssh host 'cmd'` forwarding
+            # an open terminal, or a tool that pipes stdin) wedges the adapter
+            # here forever at 0% CPU. Config comes from --file, so dsc needs no
+            # real stdin; stdout/stderr stay on the console and still stream.
+            "" | dsc config set --file $dscConfig
             $env:PATH = $prevPath
         } else {
             Write-Warning "DSC v3 is not installed. Install via: winget install Microsoft.DSC"

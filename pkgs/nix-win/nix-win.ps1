@@ -43,16 +43,36 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-# Resolve FlakeUri — if not given, look for a flake.nix in the current directory
-# and translate its Windows path to a WSL path via wslpath.
+# Translate a Windows path to a `path:`-prefixed flakeref pointing at the
+# equivalent location inside WSL. `wslpath` handles drive paths
+# (C:\... -> /mnt/c/...) but mistranslates \\wsl$ UNC paths, so those are
+# stripped to their in-distro path directly. Only genuine Windows paths may be
+# passed here: `wslpath -a` would corrupt an already-absolute /unix path into
+# /mnt/c/unix.
+function ConvertTo-WslFlakeRef {
+    param([string]$WinPath)
+    if ($WinPath -match '^\\\\wsl(?:\$|\.localhost)\\[^\\]+\\(.*)$') {
+        return "path:/$($Matches[1] -replace '\\', '/')"
+    }
+    $norm = $WinPath.Replace('\', '/')
+    $wslPath = (wsl.exe -d $WslDistro -- wslpath -a $norm 2>$null).Trim()
+    if (-not $wslPath) { throw "Could not translate Windows path to a WSL path: $WinPath" }
+    return "path:$wslPath"
+}
+
+# Resolve FlakeUri. With no -FlakeUri, use the current directory's flake. A
+# Windows drive (C:\...) or UNC (\\wsl$\...) path is translated to its WSL
+# location; a flakeref (path:/…, github:…, git+…) or bare /unix path is used
+# verbatim.
 if (-not $FlakeUri) {
     $cwdFlake = Join-Path (Get-Location).Path "flake.nix"
     if (-not (Test-Path $cwdFlake)) {
-        throw "No flake.nix found in $((Get-Location).Path). Pass -FlakeUri <path:wsl-path> or cd into a directory containing a flake.nix."
+        throw "No flake.nix found in $((Get-Location).Path). Pass -FlakeUri <Windows path, WSL path, or flakeref> or cd into a directory containing a flake.nix."
     }
-    $winPath = (Get-Location).Path.Replace('\', '/')
-    $wslPath = (wsl.exe -d $WslDistro -- wslpath -a $winPath 2>$null).Trim()
-    $FlakeUri = "path:$wslPath"
+    $FlakeUri = ConvertTo-WslFlakeRef (Get-Location).Path
+}
+elseif ($FlakeUri -match '^[A-Za-z]:[\\/]' -or $FlakeUri -match '^\\\\') {
+    $FlakeUri = ConvertTo-WslFlakeRef $FlakeUri
 }
 
 $StateDir = Join-Path $env:LOCALAPPDATA "nix-win"
@@ -76,14 +96,27 @@ function Get-StorePath {
     $uri = "$FlakeUri#$attr.config.system.build.toplevel"
 
     Write-Host "nix-win: building $uri ..." -ForegroundColor Cyan
-    # Keep stderr on — `2>/dev/null` here would silently discard
-    # nix's actual error message on a failed build, leaving the caller
-    # with nothing but "WSL command failed (exit 1)". `--print-out-paths`
-    # writes the resolved store path as the last line of stdout, so
-    # Select-Object -Last 1 still isolates it from progress chatter.
-    $output = Invoke-Wsl "nix build '$uri' --no-link --print-out-paths --no-write-lock-file"
-    $storePath = ($output | Select-Object -Last 1).Trim()
 
+    # Run the build directly (not through Invoke-Wsl) so nix's stderr — its
+    # progress bar / build log — streams live to the host console exactly as it
+    # would on the host, instead of being buffered until the build finishes.
+    # `--print-out-paths` writes the resolved store path to stdout, which we DO
+    # capture here. Leaving stderr unredirected (no `2>&1`) is the whole point:
+    # PowerShell captures only stdout into $output and passes the native
+    # command's stderr straight through to the console as it arrives.
+    #
+    # Disable native-exit auto-throw locally so the explicit $LASTEXITCODE check
+    # below owns the failure message; pwsh 7.4+ with $ErrorActionPreference='Stop'
+    # would otherwise throw a generic "wsl.exe exited with code N" at the
+    # assignment. nix's own error has already streamed to the console above, so
+    # "See the build log above" is accurate.
+    $PSNativeCommandUseErrorActionPreference = $false
+    $output = wsl.exe -d $WslDistro -u $WslUser -- bash -c "nix build '$uri' --no-link --print-out-paths --no-write-lock-file"
+    if ($LASTEXITCODE -ne 0) {
+        throw "nix build failed (exit $LASTEXITCODE). See the build log above."
+    }
+
+    $storePath = ($output | Select-Object -Last 1).Trim()
     if (-not $storePath -or -not $storePath.StartsWith("/nix/store/")) {
         throw "nix build returned invalid store path. Full output:`n$output"
     }
