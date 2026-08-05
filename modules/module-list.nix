@@ -5,6 +5,7 @@
   ./users.nix
   ./misc/assertions.nix
   ./networking.nix
+  ./home-manager.nix
   ./compat.nix
   ./files.nix
   ./links.nix

@@ -10,8 +10,17 @@
 .PARAMETER Command
     The command to run: build, switch, rollback, list-generations, gc
 
+.PARAMETER Home
+    Operate on the per-user (winHome) scope instead of the system scope.
+    `nix-win switch -Home` builds winHomeConfigurations."<user>@<host>"
+    (falling back to winHomeConfigurations."<user>") and applies it without
+    elevation: home files, junctions/symlinks, HKCU environment, and the
+    user activation script. System switches embed and apply the current
+    user's home scope automatically.
+
 .EXAMPLE
     nix-win switch
+    nix-win switch -Home
     nix-win build
     nix-win rollback
     nix-win list-generations
@@ -23,6 +32,10 @@ param(
     [Parameter(Position = 0, Mandatory)]
     [ValidateSet("build", "switch", "rollback", "list-generations", "gc")]
     [string]$Command,
+
+    [Parameter()]
+    [Alias("Home")]
+    [switch]$HomeScope,
 
     [Parameter()]
     [string]$FlakeUri = "",
@@ -42,6 +55,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+$Scope = if ($HomeScope) { "home" } else { "system" }
 
 # Translate a Windows path to a `path:`-prefixed flakeref pointing at the
 # equivalent location inside WSL. `wslpath` handles drive paths
@@ -76,10 +91,35 @@ elseif ($FlakeUri -match '^[A-Za-z]:[\\/]' -or $FlakeUri -match '^\\\\') {
 }
 
 $StateDir = Join-Path $env:LOCALAPPDATA "nix-win"
-$StateFile = Join-Path $StateDir "state.json"
-$GenerationsDir = Join-Path $StateDir "generations"
+
+# One-time migration from the single-scope v1 layout (state.json +
+# generations/<n>) to the scope-split v2 layout (state.system.json +
+# generations/system/<n>). Everything v1 tracked was applied by an
+# (elevated) system switch, so it lands in the system scope.
+$legacyState = Join-Path $StateDir "state.json"
+if ((Test-Path $legacyState) -and -not (Test-Path (Join-Path $StateDir "state.system.json"))) {
+    Write-Host "nix-win: migrating v1 state to the scope-split layout..." -ForegroundColor Yellow
+    Move-Item $legacyState (Join-Path $StateDir "state.system.json")
+    $legacyGens = Join-Path $StateDir "generations"
+    $sysGens = Join-Path $legacyGens "system"
+    if (Test-Path $legacyGens) {
+        $numeric = Get-ChildItem $legacyGens -Directory | Where-Object { $_.Name -match '^\d+$' }
+        if ($numeric) {
+            New-Item -ItemType Directory -Path $sysGens -Force | Out-Null
+            foreach ($g in $numeric) { Move-Item $g.FullName (Join-Path $sysGens $g.Name) }
+        }
+    }
+}
+
+$StateFile = Join-Path $StateDir "state.$Scope.json"
+$GenerationsDir = Join-Path $StateDir "generations" | Join-Path -ChildPath $Scope
 
 # ── Helpers ────────────────────────────────────────────────────────────────
+
+function Test-IsAdmin {
+    ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+    ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
 
 function Invoke-Wsl {
     param([string]$Cmd)
@@ -90,12 +130,8 @@ function Invoke-Wsl {
     return $result
 }
 
-function Get-StorePath {
-    $hostname = (hostname).ToLower()
-    $attr = if ($FlakeAttr) { $FlakeAttr } else { "winConfigurations.$hostname" }
-    $uri = "$FlakeUri#$attr.config.system.build.toplevel"
-
-    Write-Host "nix-win: building $uri ..." -ForegroundColor Cyan
+function Invoke-NixBuild {
+    param([string]$Uri)
 
     # Run the build directly (not through Invoke-Wsl) so nix's stderr — its
     # progress bar / build log — streams live to the host console exactly as it
@@ -111,7 +147,7 @@ function Get-StorePath {
     # assignment. nix's own error has already streamed to the console above, so
     # "See the build log above" is accurate.
     $PSNativeCommandUseErrorActionPreference = $false
-    $output = wsl.exe -d $WslDistro -u $WslUser -- bash -c "nix build '$uri' --no-link --print-out-paths --no-write-lock-file"
+    $output = wsl.exe -d $WslDistro -u $WslUser -- bash -c "nix build '$Uri' --no-link --print-out-paths --no-write-lock-file"
     if ($LASTEXITCODE -ne 0) {
         throw "nix build failed (exit $LASTEXITCODE). See the build log above."
     }
@@ -124,14 +160,46 @@ function Get-StorePath {
     return $storePath
 }
 
+function Get-StorePath {
+    $hostname = (hostname).ToLower()
+    $user = $env:USERNAME.ToLower()
+
+    if ($FlakeAttr) {
+        $suffix = if ($HomeScope) { "activationPackage" } else { "config.system.build.toplevel" }
+        $uri = "$FlakeUri#$FlakeAttr.$suffix"
+        Write-Host "nix-win: building $uri ..." -ForegroundColor Cyan
+        return Invoke-NixBuild -Uri $uri
+    }
+
+    if ($HomeScope) {
+        # Mirror home-manager's attribute resolution: "user@host" first,
+        # then bare "user".
+        $primary = "winHomeConfigurations.`"$user@$hostname`".activationPackage"
+        $fallback = "winHomeConfigurations.`"$user`".activationPackage"
+        Write-Host "nix-win: building $FlakeUri#$primary ..." -ForegroundColor Cyan
+        try {
+            return Invoke-NixBuild -Uri "$FlakeUri#$primary"
+        } catch {
+            Write-Host "nix-win: '$user@$hostname' not found or failed; trying '$user'..." -ForegroundColor Yellow
+            Write-Host "nix-win: building $FlakeUri#$fallback ..." -ForegroundColor Cyan
+            return Invoke-NixBuild -Uri "$FlakeUri#$fallback"
+        }
+    }
+
+    $uri = "$FlakeUri#winConfigurations.$hostname.config.system.build.toplevel"
+    Write-Host "nix-win: building $uri ..." -ForegroundColor Cyan
+    return Invoke-NixBuild -Uri $uri
+}
+
 function ConvertTo-WinPath {
     param([string]$WslPath)
     return "\\wsl$\$WslDistro$($WslPath -replace '/', '\')"
 }
 
 function Get-State {
-    if (Test-Path $StateFile) {
-        $raw = Get-Content $StateFile | ConvertFrom-Json -AsHashtable
+    param([string]$Path = $StateFile)
+    if (Test-Path $Path) {
+        $raw = Get-Content $Path | ConvertFrom-Json -AsHashtable
         return $raw
     }
     return @{
@@ -143,11 +211,11 @@ function Get-State {
 }
 
 function Save-State {
-    param($State)
+    param($State, [string]$Path = $StateFile)
     if (-not (Test-Path $StateDir)) {
         New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
     }
-    $State | ConvertTo-Json -Depth 10 | Set-Content $StateFile
+    $State | ConvertTo-Json -Depth 10 | Set-Content $Path
 }
 
 function Resolve-TargetRoot {
@@ -219,6 +287,12 @@ function New-ManagedLink {
         }
     }
 
+    # "auto" probes the (already-expanded) source: directory → junction
+    # (unprivileged), anything else → symlink (needs Developer Mode).
+    if ($LinkType -eq "auto") {
+        $LinkType = if (Test-Path -LiteralPath $Source -PathType Container) { "junction" } else { "symlink" }
+    }
+
     $nativeType = switch ($LinkType) {
         "junction" { "Junction" }
         "symlink"  { "SymbolicLink" }
@@ -245,11 +319,21 @@ function Deploy-Links {
         }
     }
 
+    # Home-scope (v2) link entries carry no targetRoot — their paths are
+    # home-relative by construction.
+    function Get-LinkBase {
+        param($Entry)
+        if ($Entry.PSObject.Properties['targetRoot'] -and $Entry.targetRoot) {
+            return Resolve-TargetRoot $Entry.targetRoot
+        }
+        return $env:USERPROFILE
+    }
+
     # Index declared keys up front so the removal pass can diff against the
     # previous generation's state before we start mutating anything.
     $newKeys = @{}
     foreach ($entry in $declaredLinks) {
-        $base = Resolve-TargetRoot $entry.targetRoot
+        $base = Get-LinkBase $entry
         $targetPath = Join-Path $base $entry.path
         $newKeys[$targetPath.Replace('\', '/')] = $true
     }
@@ -265,7 +349,7 @@ function Deploy-Links {
 
     # Creation pass: materialize every declared link.
     foreach ($entry in $declaredLinks) {
-        $base = Resolve-TargetRoot $entry.targetRoot
+        $base = Get-LinkBase $entry
         $targetPath = Join-Path $base $entry.path
         $source = Expand-LinkString $entry.source
         $force = [bool]$entry.force
@@ -367,13 +451,13 @@ function Sweep-StaleFiles {
 function Deploy-Files {
     param(
         [string]$WinStorePath,
-        [hashtable]$PrevFiles
+        [hashtable]$PrevFiles,
+        [string[]]$Roots = @("home", "appdata-local", "appdata-roaming", "programdata")
     )
 
     $newFiles = @{}
-    $roots = @("home", "appdata-local", "appdata-roaming", "programdata")
 
-    foreach ($root in $roots) {
+    foreach ($root in $Roots) {
         Sweep-StaleFiles -Root (Resolve-TargetRoot $root)
 
         $sourceDir = Join-Path $WinStorePath $root
@@ -421,7 +505,78 @@ function Invoke-Build {
     return @{ StorePath = $storePath; WinPath = $winPath }
 }
 
+# Apply a winHome activation package (the per-user toplevel): deploy the
+# home file tree and links, then run its activation script. Shared by the
+# standalone `switch -Home` flow and the system switch's embedded per-user
+# pass. Nothing in here requires elevation.
+function Invoke-HomeApply {
+    param(
+        [Parameter(Mandatory)][string]$HomeWinPath,
+        [hashtable]$PrevFiles = @{},
+        [hashtable]$PrevLinks = @{}
+    )
+
+    Write-Host "`nnix-win: deploying home files..." -ForegroundColor Cyan
+    $newFiles = Deploy-Files -WinStorePath $HomeWinPath -PrevFiles $PrevFiles -Roots @("home")
+
+    Write-Host "`nnix-win: deploying home links..." -ForegroundColor Cyan
+    $newLinks = Deploy-Links -WinStorePath $HomeWinPath -PrevLinks $PrevLinks
+
+    Write-Host "`nnix-win: running home activation..." -ForegroundColor Cyan
+    $env:NIX_WIN_HOME_STORE_PATH = $HomeWinPath
+    $activateScript = Join-Path $HomeWinPath "activate.ps1"
+    if (Test-Path $activateScript) {
+        & $activateScript
+    }
+
+    return @{ files = $newFiles; links = $newLinks }
+}
+
+# Standalone per-user switch: no elevation needed, and being elevated is
+# actively undesirable (files written by an admin token can pick up ACLs
+# the unelevated user then trips over).
+function Invoke-HomeSwitch {
+    if (Test-IsAdmin) {
+        Write-Warning "nix-win: switch -Home is running elevated. Home scope needs no admin; files created now may carry admin ACLs."
+    }
+
+    $build = Invoke-Build
+    $state = Get-State
+    $prevFiles = if ($state.files) { $state.files } else { @{} }
+    $prevLinks = if ($state.ContainsKey('links') -and $state.links) { $state.links } else { @{} }
+
+    $script:NewGeneration = $state.currentGeneration + 1
+    $genDir = Join-Path $GenerationsDir $script:NewGeneration
+    New-Item -ItemType Directory -Path $genDir -Force | Out-Null
+    $build.StorePath | Set-Content (Join-Path $genDir "store-path.txt")
+    (Get-Date -Format "o") | Set-Content (Join-Path $genDir "timestamp.txt")
+    $manifestSrc = Join-Path $build.WinPath "manifest.json"
+    if (Test-Path $manifestSrc) {
+        Copy-Item $manifestSrc (Join-Path $genDir "manifest.json")
+    }
+
+    $result = Invoke-HomeApply -HomeWinPath $build.WinPath -PrevFiles $prevFiles -PrevLinks $prevLinks
+
+    Save-State @{
+        currentGeneration = $script:NewGeneration
+        storePath         = $build.StorePath
+        activatedAt       = (Get-Date -Format "o")
+        files             = $result.files
+        links             = $result.links
+    }
+
+    Write-Host "`nnix-win: home switch to generation $($script:NewGeneration) complete." -ForegroundColor Green
+}
+
 function Invoke-Switch {
+    # The system scope writes ProgramData, HKLM, services, scheduled tasks,
+    # and AllUsers PowerShell modules — all of which need an admin token.
+    # Fail fast with a real message instead of a cascade of access-denied
+    # noise halfway through activation.
+    if (-not (Test-IsAdmin)) {
+        throw "nix-win: 'switch' (system scope) requires an elevated shell. Use 'nix-win switch -Home' for the no-admin per-user scope."
+    }
+
     $build = Invoke-Build
     $state = Get-State
     $prevFiles = if ($state.files) { $state.files } else { @{} }
@@ -501,6 +656,30 @@ function Invoke-Switch {
     }
     Save-State $newState
 
+    # Embedded per-user scope: apply the current user's home activation
+    # package if the toplevel carries one (home-manager integration). Runs
+    # AFTER the system phases so scoop/winget-installed tools are on PATH
+    # for user activation. Other users' packages are skipped — their
+    # profiles belong to them; they run `nix-win switch -Home` themselves.
+    $userDir = Join-Path $build.WinPath "users" | Join-Path -ChildPath $env:USERNAME.ToLower()
+    if (Test-Path -LiteralPath $userDir) {
+        Write-Host "`nnix-win: applying embedded home scope for $env:USERNAME..." -ForegroundColor Cyan
+        $homeStateFile = Join-Path $StateDir "state.home.json"
+        $homeState = Get-State -Path $homeStateFile
+        $homePrevFiles = if ($homeState.files) { $homeState.files } else { @{} }
+        $homePrevLinks = if ($homeState.ContainsKey('links') -and $homeState.links) { $homeState.links } else { @{} }
+
+        $homeResult = Invoke-HomeApply -HomeWinPath $userDir -PrevFiles $homePrevFiles -PrevLinks $homePrevLinks
+
+        Save-State -Path $homeStateFile -State @{
+            currentGeneration = $homeState.currentGeneration + 1
+            storePath         = "$($build.StorePath)/users/$($env:USERNAME.ToLower())"
+            activatedAt       = (Get-Date -Format "o")
+            files             = $homeResult.files
+            links             = $homeResult.links
+        }
+    }
+
     Write-Host "`nnix-win: switch to generation $($script:NewGeneration) complete." -ForegroundColor Green
 }
 
@@ -517,15 +696,32 @@ function Invoke-Rollback {
         Write-Error "Generation $prevGen state not found at $genDir"
         return
     }
-    Write-Host "nix-win: rolling back to generation $prevGen" -ForegroundColor Yellow
+    Write-Host "nix-win: rolling back to generation $prevGen ($Scope scope)" -ForegroundColor Yellow
     $storePath = (Get-Content $storePathFile).Trim()
-    $FlakeAttr = ""  # Use direct store path
-    # Re-activate from previous store path
     $winPath = ConvertTo-WinPath $storePath
-    $env:NIX_WIN_STORE_PATH = $winPath
-    $activateScript = Join-Path $winPath "activate.ps1"
-    if (Test-Path $activateScript) {
-        & $activateScript
+
+    if ($HomeScope) {
+        # Home rollback re-deploys the previous generation's files and
+        # links (not just re-running its activation) so removed files
+        # come back.
+        $state = Get-State
+        $prevFiles = if ($state.files) { $state.files } else { @{} }
+        $prevLinks = if ($state.ContainsKey('links') -and $state.links) { $state.links } else { @{} }
+        $result = Invoke-HomeApply -HomeWinPath $winPath -PrevFiles $prevFiles -PrevLinks $prevLinks
+        Save-State @{
+            currentGeneration = $prevGen
+            storePath         = $storePath
+            activatedAt       = (Get-Date -Format "o")
+            files             = $result.files
+            links             = $result.links
+        }
+    } else {
+        # Re-activate from previous store path
+        $env:NIX_WIN_STORE_PATH = $winPath
+        $activateScript = Join-Path $winPath "activate.ps1"
+        if (Test-Path $activateScript) {
+            & $activateScript
+        }
     }
     Write-Host "nix-win: rolled back to generation $prevGen." -ForegroundColor Green
 }
@@ -561,7 +757,7 @@ function Invoke-GC {
 
 switch ($Command) {
     "build" { Invoke-Build | Out-Null }
-    "switch" { Invoke-Switch }
+    "switch" { if ($HomeScope) { Invoke-HomeSwitch } else { Invoke-Switch } }
     "rollback" { Invoke-Rollback }
     "list-generations" { Invoke-ListGenerations }
     "gc" { Invoke-GC }

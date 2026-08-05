@@ -231,6 +231,52 @@
               hmCompatModule
             ];
           };
+          # winSystem with an embedded per-user config: the integration
+          # module must fold the user's activationPackage into the system
+          # toplevel and expose osConfig + the hm-extended lib inside the
+          # sub-eval.
+          integrated = self.lib.winSystem {
+            inherit pkgs;
+            modules = [
+              {
+                system.primaryUser = "alice";
+                home-manager.users.alice =
+                  {
+                    lib,
+                    osConfig,
+                    ...
+                  }:
+                  {
+                    home.stateVersion = "0.2";
+                    home.file.".config/nix-win/integrated-check.txt".text =
+                      "primary user is ${toString osConfig.system.primaryUser}";
+                    home.activation.integratedCheck = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
+                      Write-Host "integrated check"
+                    '';
+                  };
+              }
+            ];
+          };
+
+          # Negative test: a dep naming a non-existent activation entry must
+          # fail evaluation with the migration message (not silently reorder).
+          depThrowMsg =
+            let
+              broken = self.lib.winSystem {
+                inherit pkgs;
+                modules = [
+                  {
+                    system.primaryUser = "alice";
+                    system.activationScripts.custom = {
+                      text = "Write-Host x";
+                      deps = [ "does-not-exist" ];
+                    };
+                  }
+                ];
+              };
+              attempt = builtins.tryEval (builtins.seq broken.config.system.build.activationScript.drvPath true);
+            in
+            attempt;
         in
         {
           # Real evaluation check — building the toplevel forces the whole
@@ -238,6 +284,29 @@
           eval-minimal = minimal.config.system.build.toplevel;
 
           eval-home-minimal = homeMinimal.activationPackage;
+
+          eval-integrated =
+            pkgs.runCommand "nix-win-eval-integrated"
+              {
+                top = integrated.config.system.build.toplevel;
+              }
+              ''
+                set -eu
+                [ -f "$top/users/alice/activate.ps1" ]
+                [ -f "$top/users/alice/manifest.json" ]
+                grep -q 'primary user is alice' "$top/users/alice/home/.config/nix-win/integrated-check.txt"
+                grep -q '"users":\["alice"\]' "$top/manifest.json"
+                grep -q '"version":2' "$top/manifest.json"
+                grep -q 'integrated check' "$top/users/alice/activate.ps1"
+                touch $out
+              '';
+
+          eval-dep-throw =
+            assert !depThrowMsg.success;
+            pkgs.runCommand "nix-win-eval-dep-throw" { } ''
+              echo "missing activation dep correctly failed evaluation"
+              touch $out
+            '';
 
           eval-hm-compat =
             pkgs.runCommand "nix-win-eval-hm-compat"
