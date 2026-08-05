@@ -64,59 +64,7 @@ let
 in
 {
   options.win.files = lib.mkOption {
-    type = lib.types.attrsOf (
-      lib.types.submodule (
-        { name, ... }:
-        {
-          options = {
-            enable = lib.mkOption {
-              type = lib.types.bool;
-              default = true;
-              description = "Whether to install this file.";
-            };
-
-            source = lib.mkOption {
-              type = lib.types.nullOr lib.types.path;
-              default = null;
-              description = "Path to the source file.";
-            };
-
-            text = lib.mkOption {
-              type = lib.types.nullOr lib.types.lines;
-              default = null;
-              description = "Text content of the file.";
-            };
-
-            lineEnding = lib.mkOption {
-              type = lib.types.enum [
-                "lf"
-                "crlf"
-                "auto"
-              ];
-              default = "auto";
-              description = "Line ending style. 'auto' infers from file extension.";
-            };
-
-            targetRoot = lib.mkOption {
-              type = lib.types.enum [
-                "home"
-                "appdata-local"
-                "appdata-roaming"
-                "programdata"
-              ];
-              default = "home";
-              description = "Base directory on Windows where this file is placed.";
-            };
-
-            executable = lib.mkOption {
-              type = lib.types.bool;
-              default = false;
-              description = "Whether the file should be executable.";
-            };
-          };
-        }
-      )
-    );
+    type = (import ./shared/file-type.nix { inherit lib; }) { includeTargetRoot = true; };
     default = { };
     description = "Files to place on the Windows filesystem.";
   };

@@ -116,13 +116,24 @@
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
+
+          # A representative minimal system: exercises the module list, the
+          # file tree builder, the activation DAG, and the toplevel assembly.
+          minimal = self.lib.winSystem {
+            inherit pkgs;
+            modules = [
+              {
+                win.user.name = "alice";
+                win.files.".config/nix-win/eval-check.txt".text = "nix-win eval check";
+                win.files."Documents/PowerShell/check.ps1".text = "Write-Host 'crlf check'";
+              }
+            ];
+          };
         in
         {
-          # Minimal evaluation test — verifies module system loads and evaluates
-          eval-minimal = pkgs.runCommand "nix-win-eval-minimal" { } ''
-            echo "nix-win module system evaluates successfully"
-            touch $out
-          '';
+          # Real evaluation check — building the toplevel forces the whole
+          # module system, not just an echo.
+          eval-minimal = minimal.config.system.build.toplevel;
         }
       );
     };
