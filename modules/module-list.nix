@@ -2,7 +2,10 @@
 # New modules must be added here to be included in evaluation.
 [
   ./system.nix
-  ./user.nix
+  ./users.nix
+  ./misc/assertions.nix
+  ./networking.nix
+  ./compat.nix
   ./files.nix
   ./links.nix
   ./packages.nix

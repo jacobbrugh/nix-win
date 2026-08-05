@@ -55,7 +55,7 @@ in
       })
 
       {
-        win.activationScripts.serviceReloads.text = lib.mkAfter ''
+        system.activationScripts.serviceReloads.text = lib.mkAfter ''
             Write-Host "nix-win: reloading Komorebi..." -ForegroundColor Cyan
             if (Get-Command komorebic -ErrorAction SilentlyContinue) {
                 komorebic reload-configuration 2>$null

@@ -123,7 +123,7 @@
             inherit pkgs;
             modules = [
               {
-                win.user.name = "alice";
+                system.primaryUser = "alice";
                 win.files.".config/nix-win/eval-check.txt".text = "nix-win eval check";
                 win.files."Documents/PowerShell/check.ps1".text = "Write-Host 'crlf check'";
               }

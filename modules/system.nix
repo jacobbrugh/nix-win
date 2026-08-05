@@ -17,17 +17,29 @@ let
     files = config.system.build.fileManifest;
     links = config.system.build.linkManifest;
     scoop = {
-      enable = config.win.scoop.enable;
+      enable = config.scoop.enable;
     };
     winget = {
-      enable = config.win.winget.enable;
+      enable = config.winget.enable;
     };
     dsc = {
-      enable = config.win.dsc.enable;
+      enable = config.dsc.enable;
     };
   };
 
   manifestJson = pkgs.writeText "manifest.json" (builtins.toJSON manifest);
+
+  # Standard module-system assertion/warning enforcement (same pattern as
+  # NixOS/nix-darwin): failed assertions abort the toplevel eval, warnings
+  # print when the toplevel is evaluated.
+  failedAssertions = map (x: x.message) (lib.filter (x: !x.assertion) config.assertions);
+
+  guard =
+    drv:
+    if failedAssertions != [ ] then
+      throw "\nFailed assertions:\n${lib.concatStringsSep "\n" (map (x: "- ${x}") failedAssertions)}"
+    else
+      lib.showWarnings config.warnings drv;
 in
 {
   options.system = {
@@ -157,7 +169,7 @@ in
     };
   };
 
-  config.system.build.toplevel = pkgs.runCommand "win-system" { } ''
+  config.system.build.toplevel = guard (pkgs.runCommand "win-system" { } ''
     mkdir -p $out
 
     # Activation script
@@ -209,5 +221,5 @@ in
       mkdir -p $out/environment
       cp ${cfg.build.environmentConfig} $out/environment/user-path.json
     ''}
-  '';
+  '');
 }

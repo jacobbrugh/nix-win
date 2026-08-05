@@ -7,10 +7,10 @@
   ...
 }:
 let
-  cfg = config.win.dsc;
+  cfg = config.dsc;
 in
 {
-  options.win.dsc.psdsc.service = lib.mkOption {
+  options.dsc.psdsc.service = lib.mkOption {
     type = lib.types.attrsOf (
       lib.types.submodule {
         options = {
@@ -134,7 +134,7 @@ in
     description = "";
   };
 
-  config.win.dsc.nativeResourcesList = lib.mkIf cfg.enable (
+  config.dsc.nativeResourcesList = lib.mkIf cfg.enable (
     lib.mapAttrsToList (
       rname: props:
       {

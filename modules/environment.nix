@@ -74,7 +74,7 @@ in
   config = lib.mkIf (desiredPath != [ ]) {
     system.build.environmentConfig = desiredPathJson;
 
-    win.activationScripts.userEnvironment = {
+    system.activationScripts.userEnvironment = {
       deps = [ "files" ];
       text = ''
         Write-Host "nix-win: updating user environment..." -ForegroundColor Cyan

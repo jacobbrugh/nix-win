@@ -8,7 +8,7 @@
   ...
 }:
 let
-  cfg = config.win.winget;
+  cfg = config.winget;
 
   upgradeFlag = if cfg.upgrade then "" else " --no-upgrade";
 
@@ -33,7 +33,7 @@ let
   );
 in
 {
-  options.win.winget = {
+  options.winget = {
     enable = lib.mkEnableOption "WinGet package management";
 
     upgrade = lib.mkOption {
@@ -75,7 +75,7 @@ in
   config = lib.mkIf cfg.enable {
     system.build.wingetScript = installScript;
 
-    win.activationScripts.winget.text = ''
+    system.activationScripts.winget.text = ''
         Write-Host "nix-win: installing WinGet packages..." -ForegroundColor Cyan
         $script = Join-Path $env:NIX_WIN_STORE_PATH "winget\install.ps1"
         if (Get-Command winget -ErrorAction SilentlyContinue) {

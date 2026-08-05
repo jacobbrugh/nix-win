@@ -20,7 +20,7 @@
     # PSDesiredStateConfiguration built-in (legacy)
     ./psdsc_file.nix
 
-    # PSDscResources (win.dsc.psdsc.*)
+    # PSDscResources (dsc.psdsc.*)
     ./psdsc_archive.nix
     ./psdsc_environment.nix
     ./psdsc_group.nix

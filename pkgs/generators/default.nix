@@ -140,7 +140,7 @@ sys.stdout.buffer.write(z.read('DSCResources/MSFT_WindowsDefender/MSFT_WindowsDe
         cp ./raw.nix $out
       '';
 
-  # Helper for a PSDscResources module: all use psdsc-wrapper mode under win.dsc.psdsc.*
+  # Helper for a PSDscResources module: all use psdsc-wrapper mode under dsc.psdsc.*
   psdscMof = friendlyName: mofClass: keyProps:
     fromMof "psdsc_${lib.toLower friendlyName}"
       "${psdscResourcesSrc}/DscResources/${mofClass}/${mofClass}.schema.mof"
@@ -151,7 +151,7 @@ sys.stdout.buffer.write(z.read('DSCResources/MSFT_WindowsDefender/MSFT_WindowsDe
           "--mode"
           "psdsc-wrapper"
           "--option-path"
-          "win.dsc.psdsc.${lib.toLower friendlyName}"
+          "dsc.psdsc.${lib.toLower friendlyName}"
         ]
         ++ (if lib.length keyProps == 1 then [ "--key-prop" (lib.head keyProps) ] else [ ])
       );
@@ -168,7 +168,7 @@ sys.stdout.buffer.write(z.read('DSCResources/MSFT_WindowsDefender/MSFT_WindowsDe
         [
           "--resource-type" "NetworkingDsc/Firewall"
           "--mode" "psdsc-wrapper"
-          "--option-path" "win.dsc.firewall.rules"
+          "--option-path" "dsc.firewall.rules"
           "--key-prop" "Name"
         ];
     }
@@ -179,7 +179,7 @@ sys.stdout.buffer.write(z.read('DSCResources/MSFT_WindowsDefender/MSFT_WindowsDe
         [
           "--resource-type" "NetworkingDsc/HostsFile"
           "--mode" "psdsc-wrapper"
-          "--option-path" "win.dsc.hostsFile"
+          "--option-path" "dsc.hostsFile"
           "--key-prop" "HostName"
         ];
     }
@@ -197,7 +197,7 @@ sys.stdout.buffer.write(z.read('DSCResources/MSFT_WindowsDefender/MSFT_WindowsDe
         [
           "--resource-type" "ComputerManagementDsc/ScheduledTask"
           "--mode" "psdsc-wrapper"
-          "--option-path" "win.dsc.scheduledTasks"
+          "--option-path" "dsc.scheduledTasks"
           "--key-prop" "TaskName"
         ];
     }
@@ -207,7 +207,7 @@ sys.stdout.buffer.write(z.read('DSCResources/MSFT_WindowsDefender/MSFT_WindowsDe
       path = fromMof "xmppreference" windowsDefenderMof [
         "--resource-type" "WindowsDefender/WindowsDefender"
         "--mode" "psdsc-wrapper"
-        "--option-path" "win.dsc.defender"
+        "--option-path" "dsc.defender"
         "--key-prop" "IsSingleInstance"
       ];
     }
@@ -219,7 +219,7 @@ sys.stdout.buffer.write(z.read('DSCResources/MSFT_WindowsDefender/MSFT_WindowsDe
       path = fromMof "psdsc_file" omiDscSchemaMof [
         "--resource-type" "PSDesiredStateConfiguration/File"
         "--mode" "psdsc-wrapper"
-        "--option-path" "win.dsc.psdsc.file"
+        "--option-path" "dsc.psdsc.file"
       ];
     }
     # --- PSDscResources (all 12) ---

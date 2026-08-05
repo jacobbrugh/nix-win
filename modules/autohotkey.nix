@@ -38,7 +38,7 @@ in
       lineEnding = "lf";
     };
 
-    win.activationScripts.serviceReloads.text = lib.mkBefore ''
+    system.activationScripts.serviceReloads.text = lib.mkBefore ''
         Write-Host "nix-win: reloading AutoHotkey..." -ForegroundColor Cyan
         $ahkProc = Get-Process -Name "AutoHotkey*" -ErrorAction SilentlyContinue
         if ($ahkProc) {

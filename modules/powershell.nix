@@ -7,7 +7,7 @@
   ...
 }:
 let
-  cfg = config.win.powershell;
+  cfg = config.programs.powershell;
 
   modulesManifest = {
     pwsh7 = cfg.modules.pwsh7;
@@ -17,7 +17,11 @@ let
   manifestFile = pkgs.writeText "psmodules.json" (builtins.toJSON modulesManifest);
 in
 {
-  options.win.powershell = {
+  # Module installation is machine scope (Install-PSResource/-Module run with
+  # -Scope AllUsers, which needs admin) — hence a system-class `programs.*`
+  # option, mirroring nix-darwin's system-scope programs namespace. The
+  # per-user profile is declared here too until the winHome class exists.
+  options.programs.powershell = {
     modules = {
       pwsh7 = lib.mkOption {
         type = lib.types.attrsOf lib.types.str;
@@ -37,7 +41,9 @@ in
         '';
       };
     };
+  };
 
+  options.win.powershell = {
     profile = lib.mkOption {
       type = lib.types.nullOr lib.types.lines;
       default = null;
@@ -49,7 +55,7 @@ in
     (lib.mkIf (cfg.modules.pwsh7 != { } || cfg.modules.windowsPowerShell != { }) {
       system.build.psmodulesManifest = manifestFile;
 
-      win.activationScripts.psmodules.text = ''
+      system.activationScripts.psmodules.text = ''
           Write-Host "nix-win: installing PowerShell modules..." -ForegroundColor Cyan
           $manifest = Get-Content (Join-Path $env:NIX_WIN_STORE_PATH "powershell\psmodules.json") | ConvertFrom-Json
 
@@ -77,9 +83,9 @@ in
         '';
     })
 
-    (lib.mkIf (cfg.profile != null) {
+    (lib.mkIf (config.win.powershell.profile != null) {
       win.files."Documents/PowerShell/Microsoft.PowerShell_profile.ps1" = {
-        text = cfg.profile;
+        text = config.win.powershell.profile;
         lineEnding = "crlf";
       };
     })
