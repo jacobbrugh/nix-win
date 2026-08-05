@@ -12,7 +12,9 @@ let
 
   # Generate manifest.json from all module build outputs
   manifest = {
-    version = 1;
+    version = 2;
+    scope = "system";
+    users = builtins.attrNames cfg.build.userActivationPackages;
     stateVersion = cfg.stateVersion;
     files = config.system.build.fileManifest;
     links = config.system.build.linkManifest;
@@ -166,6 +168,17 @@ in
           `$out/environment/user-path.json` in the toplevel.
         '';
       };
+
+      userActivationPackages = lib.mkOption {
+        type = lib.types.attrsOf lib.types.package;
+        internal = true;
+        default = { };
+        description = ''
+          Per-user home activation packages (from the home-manager
+          integration module), folded into the toplevel under
+          `users/<name>/`.
+        '';
+      };
     };
   };
 
@@ -221,5 +234,13 @@ in
       mkdir -p $out/environment
       cp ${cfg.build.environmentConfig} $out/environment/user-path.json
     ''}
+
+    # Per-user home activation packages (home-manager integration)
+    ${lib.concatStringsSep "\n" (
+      lib.mapAttrsToList (name: ap: ''
+        mkdir -p $out/users
+        cp -r ${ap} $out/users/${name}
+      '') cfg.build.userActivationPackages
+    )}
   '');
 }
