@@ -11,10 +11,18 @@ let
     let
       names = builtins.attrNames entries;
 
-      # Filter deps to only reference entries that actually exist
+      # A dep naming a non-existent entry is an error, not a no-op: silently
+      # dropping it reorders the script instead of failing, which is invisible
+      # at eval and only shows up as wrong runtime behavior.
       effectiveDeps =
         name:
-        builtins.filter (d: builtins.hasAttr d entries) (entries.${name}.deps or [ ]);
+        map (
+          d:
+          if builtins.hasAttr d entries then
+            d
+          else
+            throw "nix-win: activation script '${name}' depends on '${d}', which does not exist. (If this was a nix-win built-in phase, it may have moved to the winHome class; see the migration notes in the README.)"
+        ) (entries.${name}.deps or [ ]);
 
       # Kahn's algorithm (iterative via fold)
       go =

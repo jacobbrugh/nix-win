@@ -81,13 +81,6 @@ let
     programdata = "%ProgramData%";
   };
 
-  # Target roots that require admin privileges
-  adminRoots = [
-    "programdata"
-  ];
-
-  isAdminRoot = root: builtins.elem root adminRoots;
-
   # Rust cross-compile builders — see lib/build-rust-package.nix for details.
   # Exposes both buildWindowsRustPackage (buildRustPackage-style) and
   # buildWindowsCranePackage (crane-style).
@@ -101,8 +94,6 @@ in
     mkWinFile
     escapePowershell
     targetRoots
-    adminRoots
-    isAdminRoot
     ;
   inherit (windowsRust) buildWindowsRustPackage buildWindowsCraneDepsOnly buildWindowsCranePackage;
 }
