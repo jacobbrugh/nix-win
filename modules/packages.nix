@@ -66,6 +66,45 @@ let
       lib.optionalString (entry.pathSubdir != null && entry.pathSubdir != "") "\\${entry.pathSubdir}"
     }"
   ) (lib.filterAttrs (_: e: e.addToPath) enabled);
+
+  # environment.systemPackages — the nixos/nix-darwin option shape (a plain
+  # list of packages), staged machine-wide under
+  # %ProgramData%\nix-win\Programs\<name> (passthru.nixWin.relativePath
+  # overrides the subpath). Deploy-only: machine PATH (HKLM) management is
+  # deliberately out of scope for now. Per-user packages belong in the
+  # winHome class's home.packages.
+  sysPkgMeta =
+    p:
+    let
+      m = p.passthru.nixWin or { };
+    in
+    {
+      relativePath = m.relativePath or "nix-win/Programs/${lib.getName p}";
+    };
+
+  sysPackagesSnippets = map (
+    p:
+    let
+      meta = sysPkgMeta p;
+    in
+    ''
+      dst="$out/programdata/"${lib.escapeShellArg meta.relativePath}
+      mkdir -p "$(dirname "$dst")"
+      cp -rL --no-preserve=mode "${p}" "$dst"
+      chmod -R u+w "$dst"
+    ''
+  ) config.environment.systemPackages;
+
+  combinedTree = pkgs.runCommand "win-packages" { } (
+    ''
+      mkdir -p $out
+      if [ -d "${packagesTree}" ] && [ "$(ls -A ${packagesTree})" ]; then
+        cp -r ${packagesTree}/* $out/
+        chmod -R u+w $out
+      fi
+    ''
+    + lib.concatStringsSep "\n" sysPackagesSnippets
+  );
 in
 {
   options.win.packages = lib.mkOption {
@@ -142,8 +181,19 @@ in
     '';
   };
 
+  options.environment.systemPackages = lib.mkOption {
+    type = lib.types.listOf lib.types.package;
+    default = [ ];
+    description = ''
+      Machine-scope packages staged under %ProgramData%\nix-win\Programs.
+      Deploy-only (no machine PATH management). Per-user packages belong
+      in the winHome class's home.packages.
+    '';
+  };
+
   config = {
-    system.build.packages = packagesTree;
+    system.build.packages =
+      if config.environment.systemPackages == [ ] then packagesTree else combinedTree;
 
     # Contribute PATH entries to the shared user-path helper.
     win.environment.userPath = packagePathEntries;

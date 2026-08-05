@@ -25,8 +25,14 @@ let
       inherit (entry) targetRoot executable;
     };
 
+  # environment.files entries are ProgramData-rooted by definition (the
+  # environment.etc analog — machine scope, needs an elevated switch).
+  envFiles = lib.mapAttrs (_: e: e // { targetRoot = "programdata"; }) (
+    lib.filterAttrs (_: e: e.enable) config.environment.files
+  );
+
   # All enabled file entries
-  enabledFiles = lib.filterAttrs (_: e: e.enable) cfg;
+  enabledFiles = lib.filterAttrs (_: e: e.enable) cfg // envFiles;
 
   builtFiles = lib.mapAttrs buildFile enabledFiles;
 
@@ -67,6 +73,18 @@ in
     type = (import ./shared/file-type.nix { inherit lib; }) { includeTargetRoot = true; };
     default = { };
     description = "Files to place on the Windows filesystem.";
+  };
+
+  # The environment.etc analog: machine-scope files, rooted at %ProgramData%
+  # (Windows has no /etc; ProgramData is the honest machine-config root).
+  # Same submodule shape as win.files/home.file minus the root choice.
+  options.environment.files = lib.mkOption {
+    type = (import ./shared/file-type.nix { inherit lib; }) { includeTargetRoot = false; };
+    default = { };
+    description = ''
+      Machine-scope files, placed under %ProgramData%. The per-user
+      analog is `home.file` in the winHome class.
+    '';
   };
 
   config = {
