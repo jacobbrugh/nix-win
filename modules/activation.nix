@@ -8,7 +8,7 @@
   ...
 }:
 let
-  cfg = config.win.activationScripts;
+  cfg = config.system.activationScripts;
 
   activationLib = import ../lib/activation.nix { inherit lib; };
 
@@ -16,23 +16,27 @@ let
   activationScript = activationLib.mkActivationScript cfg;
 in
 {
-  options.win.activationScripts = lib.mkOption {
+  options.system.activationScripts = lib.mkOption {
+    # A bare string is accepted and coerced to { text; deps = [ ]; } — the
+    # NixOS system.activationScripts shape.
     type = lib.types.attrsOf (
-      lib.types.submodule {
-        options = {
-          text = lib.mkOption {
-            type = lib.types.lines;
-            default = "";
-            description = "PowerShell script content for this activation phase.";
-          };
+      lib.types.coercedTo lib.types.str (text: { inherit text; }) (
+        lib.types.submodule {
+          options = {
+            text = lib.mkOption {
+              type = lib.types.lines;
+              default = "";
+              description = "PowerShell script content for this activation phase.";
+            };
 
-          deps = lib.mkOption {
-            type = lib.types.listOf lib.types.str;
-            default = [ ];
-            description = "Names of activation scripts that must run before this one.";
+            deps = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ ];
+              description = "Names of activation scripts that must run before this one.";
+            };
           };
-        };
-      }
+        }
+      )
     );
     default = { };
     description = "Named activation script entries. Ordered by dependency DAG.";
@@ -42,14 +46,14 @@ in
     # Always register pre/post activation hooks (even if empty)
     # Default activation phases — always present, modules add text via mkBefore/mkAfter.
     # Chain: preActivation → files → scoop → winget → psmodules → dsc → serviceReloads → postActivation
-    win.activationScripts.preActivation = { text = lib.mkDefault ""; deps = [ ]; };
-    win.activationScripts.files = { text = lib.mkDefault ""; deps = [ "preActivation" ]; };
-    win.activationScripts.scoop = { text = lib.mkDefault ""; deps = [ "files" ]; };
-    win.activationScripts.winget = { text = lib.mkDefault ""; deps = [ "scoop" ]; };
-    win.activationScripts.psmodules = { text = lib.mkDefault ""; deps = [ "winget" ]; };
-    win.activationScripts.dsc = { text = lib.mkDefault ""; deps = [ "psmodules" ]; };
-    win.activationScripts.serviceReloads = { text = lib.mkDefault ""; deps = [ "dsc" ]; };
-    win.activationScripts.postActivation = { text = lib.mkDefault ""; deps = [ "serviceReloads" ]; };
+    system.activationScripts.preActivation = { text = lib.mkDefault ""; deps = [ ]; };
+    system.activationScripts.files = { text = lib.mkDefault ""; deps = [ "preActivation" ]; };
+    system.activationScripts.scoop = { text = lib.mkDefault ""; deps = [ "files" ]; };
+    system.activationScripts.winget = { text = lib.mkDefault ""; deps = [ "scoop" ]; };
+    system.activationScripts.psmodules = { text = lib.mkDefault ""; deps = [ "winget" ]; };
+    system.activationScripts.dsc = { text = lib.mkDefault ""; deps = [ "psmodules" ]; };
+    system.activationScripts.serviceReloads = { text = lib.mkDefault ""; deps = [ "dsc" ]; };
+    system.activationScripts.postActivation = { text = lib.mkDefault ""; deps = [ "serviceReloads" ]; };
 
     # Export the assembled activation script as a build artifact
     system.build.activationScript = pkgs.writeText "activate.ps1" ''

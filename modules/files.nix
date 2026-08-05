@@ -74,7 +74,7 @@ in
     system.build.fileManifest = manifestEntries;
 
     # Register file copy activation script
-    win.activationScripts.files.text = ''
+    system.activationScripts.files.text = ''
       Write-Host "nix-win: placing managed files..." -ForegroundColor Cyan
       # File copy is handled by the nix-win CLI based on manifest.json
     '';

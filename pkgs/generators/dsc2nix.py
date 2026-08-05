@@ -16,7 +16,7 @@ Additional flags:
   --wrapper-inner-type T   Inner resource type for psdsc-wrapper mode
   --array-prop PROP        Array property name for container mode (default: rules)
   --container-name STR     DSC resource name for container mode (default: "<Type> Config")
-  --option-path PATH       Nix option path, dot-separated (default: win.dsc.resource."<Type>")
+  --option-path PATH       Nix option path, dot-separated (default: dsc.resource."<Type>")
   --schema-json            Input is a plain JSON schema file, not a manifest
   --mof                    Input is a MOF schema file (.schema.mof); requires --resource-type
   --resource-type TYPE     Resource type (required with --schema-json / --mof)
@@ -383,8 +383,8 @@ def load_schema(args) -> tuple[str, str, dict]:
 
 def option_path_to_nix(path: str) -> str:
     """Convert dot-separated option path to Nix attr accessor."""
-    # e.g. win.dsc.firewall.rules -> win.dsc.firewall.rules
-    # e.g. 'win.dsc.resource."Microsoft.Windows/Service"' -> as-is
+    # e.g. dsc.firewall.rules -> dsc.firewall.rules
+    # e.g. 'dsc.resource."Microsoft.Windows/Service"' -> as-is
     return path
 
 
@@ -423,14 +423,14 @@ def generate_module(args) -> str:
         nix_option_path = args.option_path
     elif mode == "psdsc-wrapper":
         inner = args.wrapper_inner_type or resource_type
-        nix_option_path = f'win.dsc.resource."{inner}"'
+        nix_option_path = f'dsc.resource."{inner}"'
     else:
-        nix_option_path = f'win.dsc.resource."{resource_type}"'
+        nix_option_path = f'dsc.resource."{resource_type}"'
 
     # Build the option path for use in config section
-    # Split off "win.dsc" prefix → cfg_attr
-    if nix_option_path.startswith("win.dsc."):
-        cfg_suffix = nix_option_path[len("win.dsc."):]
+    # Split off "dsc" prefix → cfg_attr
+    if nix_option_path.startswith("dsc."):
+        cfg_suffix = nix_option_path[len("dsc."):]
         # Handle quoted segments
         cfg_attr = "cfg." + cfg_suffix
     else:
@@ -478,7 +478,7 @@ def generate_module(args) -> str:
         threads = render_framework_threads(framework_fields, "      ")
         threads_block = f"\n{threads}" if threads else ""
         config_block = f'''\
-  config.win.dsc.nativeResourcesList = lib.mkIf cfg.enable (
+  config.dsc.nativeResourcesList = lib.mkIf cfg.enable (
     lib.mapAttrsToList (
       rname: props:
       {{
@@ -499,7 +499,7 @@ def generate_module(args) -> str:
         threads = render_framework_threads(framework_fields, "      ")
         threads_block = f"\n{threads}" if threads else ""
         config_block = f'''\
-  config.win.dsc.nativeResourcesList = lib.mkIf cfg.enable (
+  config.dsc.nativeResourcesList = lib.mkIf cfg.enable (
     lib.mapAttrsToList (
       rname: props:
       {{
@@ -523,7 +523,7 @@ def generate_module(args) -> str:
         # `framework_fields` initialization above.
         container_name = args.container_name or f"{resource_type} Config"
         config_block = f'''\
-  config.win.dsc.nativeResourcesList = lib.mkIf (cfg.enable && {cfg_attr} != {{ }}) [
+  config.dsc.nativeResourcesList = lib.mkIf (cfg.enable && {cfg_attr} != {{ }}) [
     {{
       name = "{container_name}";
       type = "{resource_type}";
@@ -546,7 +546,7 @@ def generate_module(args) -> str:
   ...
 }}:
 let
-  cfg = config.win.dsc;
+  cfg = config.dsc;
 in
 {{
   options.{nix_option_path} = lib.mkOption {{

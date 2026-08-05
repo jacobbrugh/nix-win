@@ -7,7 +7,7 @@
   ...
 }:
 let
-  cfg = config.win.scoop;
+  cfg = config.scoop;
 
   # Generate scoopfile.json matching Scoop's import format.
   # `scoop import` honors the Version field by passing name@version to
@@ -27,7 +27,7 @@ let
   scoopfile = pkgs.writeText "scoopfile.json" (builtins.toJSON scoopfileContent);
 in
 {
-  options.win.scoop = {
+  options.scoop = {
     enable = lib.mkEnableOption "Scoop package management";
 
     buckets = lib.mkOption {
@@ -88,7 +88,7 @@ in
   config = lib.mkIf cfg.enable {
     system.build.scoopfile = scoopfile;
 
-    win.activationScripts.scoop.text = ''
+    system.activationScripts.scoop.text = ''
         Write-Host "nix-win: importing Scoop packages..." -ForegroundColor Cyan
         $scoopfile = Join-Path $env:NIX_WIN_STORE_PATH "scoop\scoopfile.json"
         if (Get-Command scoop -ErrorAction SilentlyContinue) {

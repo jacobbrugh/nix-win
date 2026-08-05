@@ -7,7 +7,7 @@
   ...
 }:
 let
-  cfg = config.win.dsc;
+  cfg = config.dsc;
 
   # Collect all resources from sub-modules.
   # ssh.nix uses its own sshResources option; all generated modules write to
@@ -38,7 +38,7 @@ in
     ./generated
   ];
 
-  options.win.dsc = {
+  options.dsc = {
     enable = lib.mkEnableOption "DSC v3 configuration management";
 
     extraResources = lib.mkOption {
@@ -65,7 +65,7 @@ in
   config = lib.mkIf cfg.enable {
     system.build.dscConfig = dscYaml;
 
-    win.activationScripts.dsc.text = ''
+    system.activationScripts.dsc.text = ''
         Write-Host "nix-win: applying DSC configuration..." -ForegroundColor Cyan
         $dscConfig = Join-Path $env:NIX_WIN_STORE_PATH "dsc\config.yaml"
         if (Get-Command dsc -ErrorAction SilentlyContinue) {

@@ -6,8 +6,8 @@
   ...
 }:
 let
-  cfg = config.win.dsc;
-  sshCfg = config.win.dsc.ssh;
+  cfg = config.dsc;
+  sshCfg = config.dsc.ssh;
 
   authorizedKeysResource = lib.optional (sshCfg.authorizedKeys != [ ]) {
     name = "Admin SSH Authorized Keys";
@@ -40,7 +40,7 @@ let
   };
 in
 {
-  options.win.dsc.ssh = {
+  options.dsc.ssh = {
     authorizedKeys = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
@@ -54,7 +54,7 @@ in
     };
   };
 
-  config.win.dsc.sshResources = lib.mkIf cfg.enable (
+  config.dsc.sshResources = lib.mkIf cfg.enable (
     authorizedKeysResource ++ sshdConfigResource
   );
 }
