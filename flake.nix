@@ -89,7 +89,7 @@
           # The nix-win CLI as a plain file derivation: the .ps1 copied
           # into the Nix store at a stable name. Dotfiles repos can pin
           # the upstream CLI instead of vendoring a copy:
-          #   win.files.".local/bin/nix-win.ps1".source =
+          #   home.file.".local/bin/nix-win.ps1".source =
           #     "''${inputs.nix-win.packages.''${system}.nix-win}/nix-win.ps1";
           nix-win = pkgs.runCommand "nix-win-cli" { } ''
             mkdir -p $out
@@ -145,8 +145,8 @@
             modules = [
               {
                 system.primaryUser = "alice";
-                win.files.".config/nix-win/eval-check.txt".text = "nix-win eval check";
-                win.files."Documents/PowerShell/check.ps1".text = "Write-Host 'crlf check'";
+                environment.files."nix-win/eval-check.txt".text = "nix-win eval check";
+                environment.files."nix-win/check.ps1".text = "Write-Host 'crlf check'";
               }
             ];
           };
