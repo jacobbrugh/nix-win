@@ -7,30 +7,54 @@
 ## What is this?
 
 nix-win is a [nix-darwin](https://github.com/LnL7/nix-darwin)-style system
-manager for Windows. You write your Windows configuration as a NixOS-style
-module — users, files, scoop/winget packages, PowerShell modules, Windows
-Terminal settings, DSC resources (registry keys, scheduled tasks, firewall
-rules, services, …) — evaluate it inside WSL, and apply it to the Windows
-host.
+manager for Windows **plus** a
+[home-manager](https://github.com/nix-community/home-manager)-compatible
+per-user layer. You write your Windows configuration as NixOS-style modules —
+packages, files, registry keys, services, scheduled tasks, firewall rules on
+the system side; dotfiles, per-user programs, HKCU environment on the home
+side — evaluate it inside WSL, and apply it to the Windows host.
 
-Think `nix-darwin`, but the target is Windows.
+Think `nix-darwin` + `home-manager`, but the target is Windows.
+
+## The two module classes
+
+| Class | Analog | Scope | Applied by |
+|---|---|---|---|
+| `win` | nix-darwin | machine (ProgramData, HKLM, services, scheduled tasks, DSC) — needs admin | `nix-win switch` (elevated) |
+| `winHome` | home-manager | per-user (home files, junctions, HKCU environment, user activation) — **no admin** | `nix-win switch -Home`, or embedded in a system switch |
+
+The winHome class implements home-manager's option shapes **exactly** —
+`home.file`, `home.packages`, `home.sessionVariables`, `home.sessionPath`,
+`home.activation` (with `lib.hm.dag`, vendored verbatim from home-manager),
+`xdg.configFile`, `programs.git`, `config.lib.file.mkOutOfStoreSymlink` — so a
+module written for home-manager that sticks to that subset evaluates unchanged
+under winHome. The compatibility contract is enforced by the
+`eval-hm-compat` flake check. Deliberate deviations: `home.homeDirectory` is a
+forward-slash `str` (a Windows path can't be a Nix `path`), and
+`home.activation` text is PowerShell.
 
 ## How it works
 
 ```
 ┌────────────────────┐    ┌──────────────────────────────┐    ┌────────────────┐
-│ your flake.nix     │───▶│ eval-config.nix (in WSL)     │───▶│ Windows host   │
-│ win.scoop = { … }  │    │ lib.evalModules, class="win" │    │ activate.ps1,  │
-│ win.dsc   = { … }  │    │ → activate.ps1 + dsc/ + …    │    │ scoop, winget, │
-└────────────────────┘    └──────────────────────────────┘    │ DSC v3, files  │
-                                                              └────────────────┘
+│ your flake.nix     │───▶│ eval in WSL                  │───▶│ Windows host   │
+│ scoop = { … }      │    │ class "win" + class "winHome"│    │ activate.ps1,  │
+│ dsc   = { … }      │    │ → toplevel + users/<name>/   │    │ scoop, winget, │
+│ home-manager.users │    │                              │    │ DSC v3, files  │
+└────────────────────┘    └──────────────────────────────┘    └────────────────┘
 ```
 
 - Nix evaluation runs **inside WSL** (there is no native Windows Nix)
-- Files are **copied**, not symlinked — Windows symlinks to `\\wsl$\…` UNC paths are unreliable
-- Activation is a DAG-ordered PowerShell script:
-  `preActivation → files → scoop → winget → psmodules → dsc → serviceReloads → postActivation`
-- Generations are tracked at `%LOCALAPPDATA%\nix-win\` with rollback support
+- Files are **copied**, not symlinked — Windows symlinks to `\\wsl$\…` UNC
+  paths are unreliable. Out-of-store links (`mkOutOfStoreSymlink`) become
+  NTFS junctions/symlinks to real Windows paths.
+- System activation is a DAG-ordered PowerShell script:
+  `preActivation → files → scoop → winget → psmodules → dsc → serviceReloads → postActivation`.
+  Home activation is a `lib.hm.dag`-ordered script whose `writeBoundary`
+  node is trivially satisfied (the CLI deploys files before it runs).
+- Generations and state are tracked per scope at
+  `%LOCALAPPDATA%\nix-win\{state.system.json, state.home.json, generations/{system,home}/}`
+  with rollback support
 
 ## Requirements
 
@@ -62,57 +86,99 @@ Create a flake that depends on `nix-win`:
       pkgs    = nixpkgs.legacyPackages.x86_64-linux;
       modules = [ ./windows.nix ];
     };
+
+    # Optional: a standalone per-user configuration, applied without admin
+    # via `nix-win switch -Home`.
+    winHomeConfigurations."alice@my-pc" = nix-win.lib.winHomeConfiguration {
+      pkgs    = nixpkgs.legacyPackages.x86_64-linux;
+      modules = [ ./home.nix ];
+    };
   };
 }
 ```
 
-Write your Windows module:
+Write your Windows modules:
 
 ```nix
-# windows.nix
+# windows.nix (class "win" — machine scope)
 { ... }: {
-  win.user.name = "alice";
+  system.primaryUser = "alice";
 
-  win.scoop.enable  = true;
-  win.scoop.buckets = {
+  scoop.enable  = true;
+  scoop.buckets = {
     main   = "https://github.com/ScoopInstaller/Main";
     extras = "https://github.com/ScoopInstaller/Extras";
   };
-  win.scoop.packages = {
+  scoop.packages = {
     git     = { bucket = "main"; };
     ripgrep = { bucket = "main"; };
     fzf     = { bucket = "main"; };
   };
+
+  # Embed the per-user scope, home-manager style:
+  home-manager.users.alice = import ./home.nix;
+}
+```
+
+```nix
+# home.nix (class "winHome" — per-user scope, home-manager shapes)
+{ config, lib, ... }: {
+  home.stateVersion = "0.2";
+
+  home.file.".gitmessage".text = "…";
+  programs.git = {
+    enable = true;
+    settings.user.name = "Alice Example";
+  };
+  home.sessionPath = [ "%USERPROFILE%\\.local\\bin" ];
+  home.file."AppData/Local/nvim".source =
+    config.lib.file.mkOutOfStoreSymlink "${config.home.homeDirectory}/dotfiles/nvim";
 }
 ```
 
 Then from PowerShell on Windows (run from the repo containing this flake):
 
 ```powershell
-./pkgs/nix-win/nix-win.ps1 switch
+./pkgs/nix-win/nix-win.ps1 switch          # system + embedded home (elevated)
+./pkgs/nix-win/nix-win.ps1 switch -Home    # per-user only (no admin)
 ```
-
-This evaluates your flake inside WSL, copies the build output into
-`%USERPROFILE%` / `%APPDATA%` / `%LOCALAPPDATA%` / `%ProgramData%`, and runs
-the generated `activate.ps1`.
 
 A complete minimal example lives at
 [`examples/simple-flake/flake.nix`](./examples/simple-flake/flake.nix).
 
 ## Modules
 
-| Namespace             | Purpose                                                           |
-|-----------------------|-------------------------------------------------------------------|
-| `win.user`            | Windows user identity                                             |
-| `win.files`           | Declarative file placement (home / appdata / programdata)         |
-| `win.scoop`           | Scoop buckets and packages (mirrors nix-darwin's Homebrew module) |
-| `win.winget`          | WinGet packages                                                   |
-| `win.powershell`      | PowerShell modules and `$PROFILE` content                         |
-| `win.autohotkey`      | AutoHotkey config                                                 |
-| `win.komorebi`        | Komorebi tiling WM config                                         |
-| `win.windowsTerminal` | Windows Terminal `settings.json`                                  |
-| `win.wsl`             | `.wslconfig` management                                           |
-| `win.dsc.*`           | PowerShell DSC v3 — see below                                     |
+### Class `win` (system)
+
+| Namespace | Purpose |
+|---|---|
+| `system.primaryUser`, `users.users.<name>` | User identity (nix-darwin / NixOS shapes) |
+| `system.activationScripts` | Activation DAG (NixOS shape: string or `{ text; deps; }`) |
+| `environment.files` | Machine-scope files under `%ProgramData%` (the `environment.etc` analog) |
+| `environment.systemPackages` | Machine-scope Nix-built packages (deploy-only) |
+| `scoop`, `winget` | Package managers (top-level, mirroring nix-darwin's `homebrew`) |
+| `programs.powershell.modules` | PowerShell module installation (AllUsers ⇒ admin) |
+| `networking.hosts` | Hosts-file entries (NixOS shape: IP → hostnames) |
+| `dsc.*` | PowerShell DSC v3 — see below |
+| `home-manager.{users, sharedModules, extraSpecialArgs}` | Per-user winHome sub-evals |
+| `assertions`, `warnings` | Standard module-system diagnostics |
+
+Transitional: the pre-rename `win.*` spellings are aliased via
+`modules/compat.nix` and will be removed.
+
+### Class `winHome` (per-user)
+
+| Namespace | Purpose |
+|---|---|
+| `home.{username, homeDirectory, stateVersion}` | Identity (homeDirectory is forward-slash) |
+| `home.file`, `xdg.{configFile, dataFile}` | Dotfiles (home-manager shapes + `lineEnding` extra) |
+| `home.packages` | Per-user Nix-built packages (`passthru.nixWin` for placement) |
+| `home.sessionVariables`, `home.sessionPath` | HKCU environment (state-tracked) |
+| `home.activation` | `lib.hm.dag` of PowerShell snippets |
+| `config.lib.file.mkOutOfStoreSymlink` | NTFS junction/symlink to a real Windows path |
+| `programs.git` | `settings`/`ignores`/`attributes` → `~/.config/git/*` |
+| `programs.{powershell.profile, autohotkey, komorebi, windowsTerminal}`, `wsl.*` | Per-user program configs |
+| `assertions`, `warnings` | Standard module-system diagnostics |
 
 ### DSC resources
 
@@ -124,35 +190,50 @@ option names match the upstream field names so the [Microsoft DSC
 reference](https://learn.microsoft.com/powershell/dsc/reference/resources/)
 is directly usable.
 
-| Option path                                     | Upstream resource                      |
-|--------------------------------------------------|----------------------------------------|
-| `win.dsc.resource."Microsoft.Windows/Registry"`  | Native DSC v3 Registry                 |
-| `win.dsc.firewall.rules`                         | `NetworkingDsc/Firewall`               |
-| `win.dsc.scheduledTasks`                         | `ComputerManagementDsc/ScheduledTask`  |
-| `win.dsc.defender`                               | `WindowsDefender/xMpPreference`        |
-| `win.dsc.psdsc.service`                          | `PSDscResources/Service`               |
-| `win.dsc.psdsc.file`                             | `PSDesiredStateConfiguration/File`     |
-| `win.dsc.psdsc.{archive, environment, group, …}` | other `PSDscResources/*`               |
-| `win.dsc.ssh.{authorizedKeys, sshdConfig}`       | Hand-written SSH config wrapper        |
-| `win.dsc.extraResources`                         | Raw DSC resource escape hatch          |
+| Option path | Upstream resource |
+|---|---|
+| `dsc.resource."Microsoft.Windows/Registry"` | Native DSC v3 Registry |
+| `dsc.firewall.rules` | `NetworkingDsc/Firewall` |
+| `dsc.hostsFile` | `NetworkingDsc/HostsFile` |
+| `dsc.scheduledTasks` | `ComputerManagementDsc/ScheduledTask` |
+| `dsc.defender` | `WindowsDefender/xMpPreference` |
+| `dsc.psdsc.service` | `PSDscResources/Service` |
+| `dsc.psdsc.file` | `PSDesiredStateConfiguration/File` |
+| `dsc.psdsc.{archive, environment, group, …}` | other `PSDscResources/*` |
+| `dsc.ssh.{authorizedKeys, sshdConfig}` | Hand-written SSH config wrapper |
+| `dsc.extraResources` | Raw DSC resource escape hatch |
 
-Set `win.dsc.enable = true;` to activate the DSC phase on switch.
+Set `dsc.enable = true;` to activate the DSC phase on switch.
 
 ## CLI
 
 [`pkgs/nix-win/nix-win.ps1`](./pkgs/nix-win/nix-win.ps1) (PowerShell 7+):
 
-| Command             | What it does                                                |
-|---------------------|-------------------------------------------------------------|
-| `build`             | Evaluate and build only                                     |
-| `switch`            | Build, deploy files, and run activation scripts             |
-| `rollback`          | Roll back to the previous generation                        |
-| `list-generations`  | List stored generations                                     |
-| `gc`                | Remove old generations (keeps the 5 most recent by default) |
+| Command | What it does |
+|---|---|
+| `build` | Evaluate and build only |
+| `switch` | Build, deploy, activate the system scope + the current user's embedded home scope. **Requires an elevated shell.** |
+| `switch -Home` | Build and apply the per-user scope only. **No admin** (warns if elevated). |
+| `rollback` | Roll back the selected scope to its previous generation |
+| `list-generations` | List stored generations for the selected scope |
+| `gc` | Remove old generations (keeps the 5 most recent by default) |
 
-Pass `-FlakeUri` to point the CLI at a flake other than the current directory,
-and `-WslDistro` / `-WslUser` to target a different WSL distro or user. Run
+`-Home` selects the per-user scope on every verb. The home attribute is
+resolved home-manager-style: `winHomeConfigurations."<user>@<host>"`, then
+`winHomeConfigurations."<user>"`. Pass `-FlakeUri` to point the CLI at a
+flake other than the current directory, and `-WslDistro` / `-WslUser` to
+target a different WSL distro or user. Run
 `Get-Help ./pkgs/nix-win/nix-win.ps1 -Full` for the full parameter list.
+
+### Migration notes (v2)
+
+- Activation phase names: `files` and `userEnvironment` still exist in the
+  system chain, but per-user file deployment and HKCU PATH management moved
+  to the winHome class (`home.file`, `home.sessionPath`). A
+  `system.activationScripts` dep naming a phase that no longer exists is an
+  eval error (deliberately — silent dep-drops reordered scripts invisibly).
+- State migrates automatically: `state.json` → `state.system.json`,
+  `generations/<n>` → `generations/system/<n>` on first run.
 
 ## Architecture
 
@@ -161,10 +242,11 @@ DSC generator pipeline, see [`CLAUDE.md`](./CLAUDE.md).
 
 ## Inspiration and prior art
 
-- [nix-darwin](https://github.com/LnL7/nix-darwin) — the direct inspiration;
-  `eval-config.nix` and the Scoop module structure mirror it
-- [home-manager](https://github.com/nix-community/home-manager) — the pattern
-  of declarative per-user dotfile management
+- [nix-darwin](https://github.com/LnL7/nix-darwin) — the direct inspiration
+  for the system class; `eval-config.nix` and the Scoop module mirror it
+- [home-manager](https://github.com/nix-community/home-manager) — the winHome
+  class implements its option shapes; `lib/hm/` vendors its dag library
+  verbatim and `eval-home.nix` mirrors `homeManagerConfiguration`
 - [NixOS](https://nixos.org) — the module system itself
 - [NixOS-WSL](https://github.com/nix-community/NixOS-WSL) — what makes running
   Nix on Windows practical in the first place
