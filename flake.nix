@@ -34,6 +34,27 @@
             };
           in
           evalResult;
+
+        # Standalone per-user configuration — the home-manager
+        # `homeManagerConfiguration` analog. `lib` accepts the consumer's
+        # (possibly extended) nixpkgs lib; it is hm-extended internally.
+        winHomeConfiguration =
+          {
+            pkgs,
+            modules ? [ ],
+            extraSpecialArgs ? { },
+            lib ? pkgs.lib,
+          }:
+          let
+            evalResult = import ./eval-home.nix { inherit lib; } {
+              inherit modules pkgs;
+              specialArgs = extraSpecialArgs;
+            };
+          in
+          {
+            inherit (evalResult) config options;
+            activationPackage = evalResult.config.home.activationPackage;
+          };
       }
       # Per-system helpers. Exposes the Rust cross-compile wrapper so
       # consumer flakes can build Windows binaries from their own
@@ -129,11 +150,129 @@
               }
             ];
           };
+
+          # Minimal per-user configuration: exercises home.file (text +
+          # source + executable), xdg.configFile, sessionPath/-Variables,
+          # the activation DAG, and activationPackage assembly.
+          homeMinimal = self.lib.winHomeConfiguration {
+            inherit pkgs;
+            modules = [
+              {
+                home.username = "alice";
+                home.stateVersion = "0.2";
+                home.file.".config/nix-win/home-check.txt".text = "winHome eval check";
+                home.file."bin/tool.py" = {
+                  text = "print('x')";
+                  executable = true;
+                };
+                xdg.configFile."app/settings.json".text = ''{ "a": 1 }'';
+                home.sessionPath = [ "%USERPROFILE%\\.local\\bin" ];
+                home.sessionVariables.NIX_WIN_CHECK = "1";
+              }
+            ];
+          };
+
+          # THE home-manager compatibility contract test: a module written
+          # in home-manager idiom — custom options, home.file with
+          # source/executable, programs.git settings/ignores/attributes,
+          # ${config.home.homeDirectory} interpolation, out-of-store links,
+          # lib.hm.dag.entryAfter — must evaluate unchanged under winHome,
+          # and the rendered artifacts must match expectations.
+          hmCompatModule =
+            { config, lib, ... }:
+            {
+              options.programs.check.marker = lib.mkOption {
+                type = lib.types.str;
+                default = "unset";
+              };
+
+              config = {
+                programs.check.marker = "set-by-module";
+
+                home.file.".claude/hooks/check-hook.py" = {
+                  text = "#!/usr/bin/env python3\nprint('hook')\n";
+                  executable = true;
+                };
+
+                home.file."AppData/Local/check-link".source =
+                  config.lib.file.mkOutOfStoreSymlink "${config.home.homeDirectory}/.config/check-src";
+
+                programs.git = {
+                  enable = true;
+                  settings = {
+                    user.name = "Alice Example";
+                    alias.st = "status";
+                  };
+                  ignores = [ "*.tmp" ];
+                  attributes = [ "* merge=mergiraf" ];
+                };
+
+                home.activation.checkEntry = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
+                  Write-Host "check: ${config.programs.check.marker} at ${config.home.homeDirectory}"
+                '';
+
+                warnings = [ "hm-compat check warning (expected)" ];
+                assertions = [
+                  {
+                    assertion = true;
+                    message = "never shown";
+                  }
+                ];
+              };
+            };
+
+          hmCompat = self.lib.winHomeConfiguration {
+            inherit pkgs;
+            modules = [
+              {
+                home.username = "alice";
+                home.stateVersion = "0.2";
+              }
+              hmCompatModule
+            ];
+          };
         in
         {
           # Real evaluation check — building the toplevel forces the whole
           # module system, not just an echo.
           eval-minimal = minimal.config.system.build.toplevel;
+
+          eval-home-minimal = homeMinimal.activationPackage;
+
+          eval-hm-compat =
+            pkgs.runCommand "nix-win-eval-hm-compat"
+              {
+                ap = hmCompat.activationPackage;
+                homeDir = hmCompat.config.home.homeDirectory;
+              }
+              ''
+                set -eu
+                # homeDirectory is forward-slash normalized
+                [ "$homeDir" = "C:/Users/alice" ]
+
+                # Staged hook file exists and is executable
+                [ -x "$ap/home/.claude/hooks/check-hook.py" ]
+
+                # git config rendered with toGitINI semantics
+                grep -q 'name = "Alice Example"' "$ap/home/.config/git/config"
+                grep -q 'st = "status"' "$ap/home/.config/git/config"
+                grep -qx '\*.tmp' "$ap/home/.config/git/ignore"
+                grep -qx '\* merge=mergiraf' "$ap/home/.config/git/attributes"
+
+                # Out-of-store source became a link-manifest entry, not a file
+                grep -q '"path":"AppData/Local/check-link"' "$ap/manifest.json"
+                grep -q '"source":"C:/Users/alice/.config/check-src"' "$ap/manifest.json"
+                [ ! -e "$ap/home/AppData/Local/check-link" ]
+
+                # Activation entry interpolated config values and sorted
+                # after writeBoundary
+                grep -q 'check: set-by-module at C:/Users/alice' "$ap/activate.ps1"
+                wb=$(grep -n 'writeBoundary' "$ap/activate.ps1" | head -1 | cut -d: -f1)
+                ce=$(grep -n 'check: set-by-module' "$ap/activate.ps1" | head -1 | cut -d: -f1)
+                [ "$wb" -lt "$ce" ]
+
+                touch $out
+              '';
         }
       );
     };
