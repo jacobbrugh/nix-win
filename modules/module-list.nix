@@ -6,18 +6,11 @@
   ./misc/assertions.nix
   ./networking.nix
   ./home-manager.nix
-  ./compat.nix
-  ./files.nix
-  ./links.nix
-  ./packages.nix
-  ./environment.nix
+  ./environment-files.nix
+  ./system-packages.nix
   ./activation.nix
   ./scoop.nix
   ./winget.nix
   ./powershell.nix
   ./dsc
-  ./autohotkey.nix
-  ./komorebi.nix
-  ./wslconfig.nix
-  ./windows-terminal.nix
 ]

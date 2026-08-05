@@ -73,7 +73,7 @@ in
         default = null;
         description = ''
           Derivation containing all Nix-built Windows packages
-          declared via `win.packages`, laid out under the same
+          declared via `environment.systemPackages`, laid out under the same
           `home/`, `appdata-local/`, etc. roots as `system.build.files`.
         '';
       };

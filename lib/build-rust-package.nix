@@ -45,7 +45,7 @@
 #   }
 #
 # Both produce PE32+ executables under `$out/bin/`. Pass the whole output
-# directory to `win.packages.<name>.package` to ship it.
+# directory to `home.packages` (winHome) or `environment.systemPackages` to ship it.
 
 { pkgs }:
 

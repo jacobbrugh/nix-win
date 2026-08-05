@@ -43,14 +43,8 @@ in
     };
   };
 
-  options.win.powershell = {
-    profile = lib.mkOption {
-      type = lib.types.nullOr lib.types.lines;
-      default = null;
-      description = "Content for the PowerShell 7 profile (Microsoft.PowerShell_profile.ps1).";
-    };
-  };
-
+  # The per-user profile is `programs.powershell.profile` in the winHome
+  # class; only machine-scope module installation lives here.
   config = lib.mkMerge [
     (lib.mkIf (cfg.modules.pwsh7 != { } || cfg.modules.windowsPowerShell != { }) {
       system.build.psmodulesManifest = manifestFile;
@@ -81,13 +75,6 @@ in
               powershell.exe -NoProfile -Command "Get-Module -ListAvailable '$name' | Where-Object { `$_.Version -ne '$version' } | ForEach-Object { Uninstall-Module -Name '$name' -RequiredVersion `$_.Version -Force -ErrorAction SilentlyContinue }"
           }
         '';
-    })
-
-    (lib.mkIf (config.win.powershell.profile != null) {
-      win.files."Documents/PowerShell/Microsoft.PowerShell_profile.ps1" = {
-        text = config.win.powershell.profile;
-        lineEnding = "crlf";
-      };
     })
   ];
 }
