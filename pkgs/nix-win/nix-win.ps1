@@ -276,8 +276,16 @@ function New-ManagedLink {
     if ($existing) {
         if ($existing.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
             # Already a link/junction. If it already points at our source,
-            # we're done; otherwise replace it.
-            if ($existing.Target -and $existing.Target -eq $Source) { return }
+            # we're done; otherwise replace it. Compare normalized: the
+            # manifest declares forward-slash targets while NTFS reports
+            # backslash (a strict compare recreated the link every switch);
+            # PS 7.0/7.1 surface Target as string[], and some .NET builds
+            # report the raw \\?\ / \??\ mount-point form. -eq is already
+            # case-insensitive for strings.
+            $reported = [string](@($existing.Target)[0])
+            $reported = ($reported -replace '^(\\\\\?\\|\\\?\?\\)', '').Replace('/', '\').TrimEnd('\')
+            $declared = $Source.Replace('/', '\').TrimEnd('\')
+            if ($reported -and $reported -eq $declared) { return }
             Remove-Item -LiteralPath $TargetPath -Force
         } elseif ($Force) {
             Remove-Item -LiteralPath $TargetPath -Force -Recurse
@@ -437,14 +445,17 @@ function Copy-FileRobust {
 }
 
 # Best-effort cleanup of rename-aside markers from prior switches.
-# Called at the top of each root's Deploy-Files pass so orphans don't
-# accumulate across generations once their holders exit.
+# Deploy-Files hands it the (non-recursive) set of directories that can
+# actually hold markers, so orphans don't accumulate across generations
+# once their holders exit.
 function Sweep-StaleFiles {
-    param([string]$Root)
-    if (-not (Test-Path -LiteralPath $Root)) { return }
-    Get-ChildItem -LiteralPath $Root -Recurse -File -Filter '*.nix-win-stale-*' `
-        -ErrorAction SilentlyContinue | ForEach-Object {
-        try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop } catch {}
+    param([string[]]$Directories)
+    foreach ($dir in $Directories) {
+        if (-not (Test-Path -LiteralPath $dir)) { continue }
+        Get-ChildItem -LiteralPath $dir -File -Filter '*.nix-win-stale-*' `
+            -ErrorAction SilentlyContinue | ForEach-Object {
+            try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop } catch {}
+        }
     }
 }
 
@@ -452,47 +463,91 @@ function Deploy-Files {
     param(
         [string]$WinStorePath,
         [hashtable]$PrevFiles,
-        [string[]]$Roots = @("home", "appdata-local", "appdata-roaming", "programdata")
+        [string[]]$Roots = @("home", "appdata-local", "appdata-roaming", "programdata"),
+        # Where to back up unmanaged files we're about to overwrite —
+        # the invoking scope's generations/<scope>/<gen>/backups. Empty
+        # skips backups (rollback re-deploys known-managed trees).
+        [string]$BackupDir
     )
 
     $newFiles = @{}
 
-    foreach ($root in $Roots) {
-        Sweep-StaleFiles -Root (Resolve-TargetRoot $root)
-
+    # Enumerate incoming deployments up front: feeds both the stale sweep
+    # and the deploy pass.
+    $incoming = foreach ($root in $Roots) {
         $sourceDir = Join-Path $WinStorePath $root
         if (-not (Test-Path $sourceDir)) { continue }
-
         $baseTarget = Resolve-TargetRoot $root
-        $files = Get-ChildItem -Path $sourceDir -Recurse -File
-
-        foreach ($file in $files) {
+        foreach ($file in Get-ChildItem -Path $sourceDir -Recurse -File) {
             $relativePath = $file.FullName.Substring($sourceDir.Length + 1)
-            $targetPath = Join-Path $baseTarget $relativePath
-            $targetDir = Split-Path $targetPath -Parent
-
-            if (-not (Test-Path $targetDir)) {
-                New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+            [pscustomobject]@{
+                Source       = $file.FullName
+                RelativePath = $relativePath
+                TargetPath   = Join-Path $baseTarget $relativePath
             }
-
-            # Backup existing file if not previously managed
-            $fileKey = $targetPath.Replace('\', '/')
-            if ((Test-Path $targetPath) -and -not $PrevFiles.ContainsKey($fileKey)) {
-                $genDir = Join-Path $GenerationsDir $script:NewGeneration "backups"
-                if (-not (Test-Path $genDir)) {
-                    New-Item -ItemType Directory -Path $genDir -Force | Out-Null
-                }
-                $backupName = $targetPath.Replace('\', '--').Replace(':', '-')
-                Copy-Item $targetPath (Join-Path $genDir $backupName) -Force
-            }
-
-            Copy-FileRobust -Source $file.FullName -Destination $targetPath
-            $newFiles[$fileKey] = @{ status = "managed" }
-            Write-Host "  $relativePath -> $targetPath" -ForegroundColor DarkGray
         }
     }
 
+    # Sweep rename-aside markers (Copy-FileRobust's *.nix-win-stale-*)
+    # before deploying. Markers are only ever created NEXT TO a managed
+    # file, so the parent dirs of previously-managed plus incoming files
+    # bound the search — no full-root recursion (which used to walk all
+    # of %USERPROFILE% and friends on every switch). Residual gap: a file
+    # removed from config while its holder process lives leaves a marker
+    # that exits the swept set once it leaves state.
+    $sweepDirs = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($key in $PrevFiles.Keys) {
+        $parent = Split-Path $key.Replace('/', '\') -Parent
+        if ($parent) { [void]$sweepDirs.Add($parent) }
+    }
+    foreach ($entry in $incoming) {
+        $parent = Split-Path $entry.TargetPath -Parent
+        if ($parent) { [void]$sweepDirs.Add($parent) }
+    }
+    Sweep-StaleFiles -Directories @($sweepDirs)
+
+    foreach ($entry in $incoming) {
+        $targetPath = $entry.TargetPath
+        $targetDir = Split-Path $targetPath -Parent
+
+        if (-not (Test-Path $targetDir)) {
+            New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+        }
+
+        # Backup existing file if not previously managed
+        $fileKey = $targetPath.Replace('\', '/')
+        if ($BackupDir -and (Test-Path $targetPath) -and -not $PrevFiles.ContainsKey($fileKey)) {
+            if (-not (Test-Path $BackupDir)) {
+                New-Item -ItemType Directory -Path $BackupDir -Force | Out-Null
+            }
+            $backupName = $targetPath.Replace('\', '--').Replace(':', '-')
+            Copy-Item $targetPath (Join-Path $BackupDir $backupName) -Force
+        }
+
+        Copy-FileRobust -Source $entry.Source -Destination $targetPath
+        $newFiles[$fileKey] = @{ status = "managed" }
+        Write-Host "  $($entry.RelativePath) -> $targetPath" -ForegroundColor DarkGray
+    }
+
     return $newFiles
+}
+
+# Record a generation on disk: the generation directory plus
+# store-path.txt / timestamp.txt / manifest.json. rollback and
+# list-generations read these records — a bumped counter without one is
+# a generation that can never be rolled back to.
+function Write-GenerationRecord {
+    param(
+        [Parameter(Mandatory)][string]$GenDir,
+        [Parameter(Mandatory)][string]$StorePath,
+        [string]$ManifestPath
+    )
+    New-Item -ItemType Directory -Path $GenDir -Force | Out-Null
+    $StorePath | Set-Content (Join-Path $GenDir "store-path.txt")
+    (Get-Date -Format "o") | Set-Content (Join-Path $GenDir "timestamp.txt")
+    if ($ManifestPath -and (Test-Path $ManifestPath)) {
+        Copy-Item $ManifestPath (Join-Path $GenDir "manifest.json")
+    }
 }
 
 # ── Commands ───────────────────────────────────────────────────────────────
@@ -513,11 +568,14 @@ function Invoke-HomeApply {
     param(
         [Parameter(Mandatory)][string]$HomeWinPath,
         [hashtable]$PrevFiles = @{},
-        [hashtable]$PrevLinks = @{}
+        [hashtable]$PrevLinks = @{},
+        # Omitted on rollback: re-deploying a known-managed tree backs
+        # nothing up.
+        [string]$BackupDir
     )
 
     Write-Host "`nnix-win: deploying home files..." -ForegroundColor Cyan
-    $newFiles = Deploy-Files -WinStorePath $HomeWinPath -PrevFiles $PrevFiles -Roots @("home")
+    $newFiles = Deploy-Files -WinStorePath $HomeWinPath -PrevFiles $PrevFiles -Roots @("home") -BackupDir $BackupDir
 
     Write-Host "`nnix-win: deploying home links..." -ForegroundColor Cyan
     $newLinks = Deploy-Links -WinStorePath $HomeWinPath -PrevLinks $PrevLinks
@@ -547,15 +605,11 @@ function Invoke-HomeSwitch {
 
     $script:NewGeneration = $state.currentGeneration + 1
     $genDir = Join-Path $GenerationsDir $script:NewGeneration
-    New-Item -ItemType Directory -Path $genDir -Force | Out-Null
-    $build.StorePath | Set-Content (Join-Path $genDir "store-path.txt")
-    (Get-Date -Format "o") | Set-Content (Join-Path $genDir "timestamp.txt")
-    $manifestSrc = Join-Path $build.WinPath "manifest.json"
-    if (Test-Path $manifestSrc) {
-        Copy-Item $manifestSrc (Join-Path $genDir "manifest.json")
-    }
+    Write-GenerationRecord -GenDir $genDir -StorePath $build.StorePath `
+        -ManifestPath (Join-Path $build.WinPath "manifest.json")
 
-    $result = Invoke-HomeApply -HomeWinPath $build.WinPath -PrevFiles $prevFiles -PrevLinks $prevLinks
+    $result = Invoke-HomeApply -HomeWinPath $build.WinPath -PrevFiles $prevFiles -PrevLinks $prevLinks `
+        -BackupDir (Join-Path $genDir "backups")
 
     Save-State @{
         currentGeneration = $script:NewGeneration
@@ -584,20 +638,12 @@ function Invoke-Switch {
 
     $script:NewGeneration = $state.currentGeneration + 1
     $genDir = Join-Path $GenerationsDir $script:NewGeneration
-    New-Item -ItemType Directory -Path $genDir -Force | Out-Null
-
-    # Save store path for this generation
-    $build.StorePath | Set-Content (Join-Path $genDir "store-path.txt")
-    (Get-Date -Format "o") | Set-Content (Join-Path $genDir "timestamp.txt")
-
-    # Copy manifest
-    $manifestSrc = Join-Path $build.WinPath "manifest.json"
-    if (Test-Path $manifestSrc) {
-        Copy-Item $manifestSrc (Join-Path $genDir "manifest.json")
-    }
+    Write-GenerationRecord -GenDir $genDir -StorePath $build.StorePath `
+        -ManifestPath (Join-Path $build.WinPath "manifest.json")
 
     Write-Host "`nnix-win: deploying files..." -ForegroundColor Cyan
-    $newFiles = Deploy-Files -WinStorePath $build.WinPath -PrevFiles $prevFiles
+    $newFiles = Deploy-Files -WinStorePath $build.WinPath -PrevFiles $prevFiles `
+        -BackupDir (Join-Path $genDir "backups")
 
     Write-Host "`nnix-win: deploying links..." -ForegroundColor Cyan
     $newLinks = Deploy-Links -WinStorePath $build.WinPath -PrevLinks $prevLinks
@@ -669,11 +715,24 @@ function Invoke-Switch {
         $homePrevFiles = if ($homeState.files) { $homeState.files } else { @{} }
         $homePrevLinks = if ($homeState.ContainsKey('links') -and $homeState.links) { $homeState.links } else { @{} }
 
-        $homeResult = Invoke-HomeApply -HomeWinPath $userDir -PrevFiles $homePrevFiles -PrevLinks $homePrevLinks
+        # Record the home generation exactly like a standalone `switch
+        # -Home` would — rollback -Home and list-generations -Home read
+        # the on-disk record, not the counter in state.home.json. Note
+        # the home scope's dirs, NOT this invocation's ($GenerationsDir
+        # and $genDir are the system scope's here).
+        $homeGen = $homeState.currentGeneration + 1
+        $homeGenDir = Join-Path $StateDir "generations" |
+            Join-Path -ChildPath "home" | Join-Path -ChildPath $homeGen
+        $homeStorePath = "$($build.StorePath)/users/$($env:USERNAME.ToLower())"
+        Write-GenerationRecord -GenDir $homeGenDir -StorePath $homeStorePath `
+            -ManifestPath (Join-Path $userDir "manifest.json")
+
+        $homeResult = Invoke-HomeApply -HomeWinPath $userDir -PrevFiles $homePrevFiles -PrevLinks $homePrevLinks `
+            -BackupDir (Join-Path $homeGenDir "backups")
 
         Save-State -Path $homeStateFile -State @{
-            currentGeneration = $homeState.currentGeneration + 1
-            storePath         = "$($build.StorePath)/users/$($env:USERNAME.ToLower())"
+            currentGeneration = $homeGen
+            storePath         = $homeStorePath
             activatedAt       = (Get-Date -Format "o")
             files             = $homeResult.files
             links             = $homeResult.links
@@ -703,7 +762,8 @@ function Invoke-Rollback {
     if ($HomeScope) {
         # Home rollback re-deploys the previous generation's files and
         # links (not just re-running its activation) so removed files
-        # come back.
+        # come back. No -BackupDir: re-deploying a known-managed tree
+        # backs nothing up.
         $state = Get-State
         $prevFiles = if ($state.files) { $state.files } else { @{} }
         $prevLinks = if ($state.ContainsKey('links') -and $state.links) { $state.links } else { @{} }

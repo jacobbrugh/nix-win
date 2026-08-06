@@ -43,12 +43,6 @@ in
   options.wsl = {
     enable = lib.mkEnableOption "WSL configuration (.wslconfig)";
 
-    distroName = lib.mkOption {
-      type = lib.types.str;
-      default = "NixOS";
-      description = "Default WSL distribution name for the nix-win CLI.";
-    };
-
     wsl2 = lib.mkOption {
       type = settingsType;
       default = { };

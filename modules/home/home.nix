@@ -126,14 +126,27 @@ in
         cp ${cfg.build.activationScript} $out/activate.ps1
         cp ${manifestJson} $out/manifest.json
 
-        if [ -d "${cfg.build.files}" ] && [ "$(ls -A ${cfg.build.files})" ]; then
-          cp -r ${cfg.build.files}/* $out/ 2>/dev/null || true
-        fi
+        # Merge the staged trees. cp must preserve mode (the +x bit on staged
+        # hooks is contract-tested by eval-hm-compat); the chmod after each
+        # copy re-opens the store's 0555 directories so the next tree can
+        # merge into them. Nothing here may swallow stderr or mask the exit
+        # status — a copy that cannot land its payload must fail the build.
+        cp -rL ${cfg.build.files}/. $out/
+        chmod -R u+w $out
 
         ${lib.optionalString (cfg.build.packagesTree != null) ''
-          if [ -d "${cfg.build.packagesTree}" ] && [ "$(ls -A ${cfg.build.packagesTree})" ]; then
-            cp -r ${cfg.build.packagesTree}/* $out/ 2>/dev/null || true
+          # A path staged by both home.file and home.packages would be a
+          # silent last-wins overwrite; fail the build instead.
+          collisions=$(comm -12 \
+            <(cd ${cfg.build.files} && find . -type f | sort) \
+            <(cd ${cfg.build.packagesTree} && find . -type f | sort))
+          if [ -n "$collisions" ]; then
+            echo "error: home.file and home.packages stage the same path(s):" >&2
+            echo "$collisions" >&2
+            exit 1
           fi
+          cp -rL ${cfg.build.packagesTree}/. $out/
+          chmod -R u+w $out
         ''}
 
         ${lib.concatStringsSep "\n" (

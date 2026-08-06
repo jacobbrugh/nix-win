@@ -191,18 +191,29 @@ in
     # Manifest
     cp ${manifestJson} $out/manifest.json
 
-    # Files tree
-    if [ -d "${cfg.build.files}" ] && [ "$(ls -A ${cfg.build.files})" ]; then
-      cp -r ${cfg.build.files}/* $out/ 2>/dev/null || true
-    fi
+    # Files tree. cp must preserve mode; the chmod after each copy re-opens
+    # the store's 0555 directories so the next tree can merge into them.
+    # Nothing here may swallow stderr or mask the exit status — a copy that
+    # cannot land its payload must fail the build.
+    cp -rL ${cfg.build.files}/. $out/
+    chmod -R u+w $out
 
     # Packages tree — merges alongside the files tree under the same
-    # home/, appdata-local/, etc. roots so Deploy-Files in the CLI
-    # picks everything up with a single pass.
+    # programdata/ root so Deploy-Files in the CLI picks everything up
+    # with a single pass.
     ${lib.optionalString (cfg.build.packages != null) ''
-      if [ -d "${cfg.build.packages}" ] && [ "$(ls -A ${cfg.build.packages})" ]; then
-        cp -r ${cfg.build.packages}/* $out/ 2>/dev/null || true
+      # A path staged by both environment.files and environment.systemPackages
+      # would be a silent last-wins overwrite; fail the build instead.
+      collisions=$(comm -12 \
+        <(cd ${cfg.build.files} && find . -type f | sort) \
+        <(cd ${cfg.build.packages} && find . -type f | sort))
+      if [ -n "$collisions" ]; then
+        echo "error: environment.files and environment.systemPackages stage the same path(s):" >&2
+        echo "$collisions" >&2
+        exit 1
       fi
+      cp -rL ${cfg.build.packages}/. $out/
+      chmod -R u+w $out
     ''}
 
     # Scoop
@@ -239,7 +250,7 @@ in
     ${lib.concatStringsSep "\n" (
       lib.mapAttrsToList (name: ap: ''
         mkdir -p $out/users
-        cp -r ${ap} $out/users/${name}
+        cp -r ${ap} "$out/users/"${lib.escapeShellArg name}
       '') cfg.build.userActivationPackages
     )}
   '');

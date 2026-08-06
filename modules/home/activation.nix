@@ -64,8 +64,22 @@ in
           IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam,
           uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);
       '@
-              $script:NixWinEnvType = Add-Type -MemberDefinition $sig -Name 'NixWinEnv' `
-                  -Namespace 'NixWin' -PassThru -ErrorAction SilentlyContinue
+              try {
+                  # -PassThru returns an array of generated types; take the
+                  # first explicitly rather than relying on single-element
+                  # unrolling.
+                  $script:NixWinEnvType = @(Add-Type -MemberDefinition $sig -Name 'NixWinEnv' `
+                      -Namespace 'NixWin' -PassThru)[0]
+              } catch {
+                  # Add-Type fails if the type already exists in this session
+                  # (activation dot-sourced twice) — recover it. Anything else
+                  # must be LOUD: a silently skipped broadcast means running
+                  # sessions never see HKCU environment changes.
+                  $script:NixWinEnvType = 'NixWin.NixWinEnv' -as [type]
+                  if (-not $script:NixWinEnvType) {
+                      Write-Warning "nix-win: WM_SETTINGCHANGE helper failed to compile ($($_.Exception.Message)); running sessions will not see HKCU environment changes until re-login."
+                  }
+              }
           }
           if ($script:NixWinEnvType) {
               $HWND_BROADCAST = [IntPtr]0xffff

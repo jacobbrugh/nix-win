@@ -57,22 +57,6 @@ let
     in
     if effectiveLineEnding == "crlf" then toCrlf name rawSource else rawSource;
 
-  # Escape a string for use in PowerShell
-  escapePowershell =
-    s:
-    builtins.replaceStrings
-      [
-        "'"
-        "`"
-        "$"
-      ]
-      [
-        "''"
-        "``"
-        "`$"
-      ]
-      s;
-
   # Windows path roots mapping
   targetRoots = {
     home = "%USERPROFILE%";
@@ -92,7 +76,6 @@ in
     autoLineEnding
     toCrlf
     mkWinFile
-    escapePowershell
     targetRoots
     ;
   inherit (windowsRust) buildWindowsRustPackage buildWindowsCraneDepsOnly buildWindowsCranePackage;
