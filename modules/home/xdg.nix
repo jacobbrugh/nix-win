@@ -76,6 +76,31 @@ in
     xdg.dataHome = lib.mkDefault "${config.home.homeDirectory}/.local/share";
     xdg.cacheHome = lib.mkDefault "${config.home.homeDirectory}/.cache";
 
+    # `rel` is a removePrefix, which silently no-ops on a non-matching
+    # prefix — an xdg base dir outside homeDirectory (or spelled with
+    # backslashes) would otherwise stage to a garbage home-relative
+    # target like "home/C:/Users/...".
+    assertions =
+      map
+        (dir: {
+          assertion = lib.hasPrefix (config.home.homeDirectory + "/") dir.value;
+          message = ''
+            xdg.${dir.name} (${dir.value}) must live under home.homeDirectory
+            (${config.home.homeDirectory}) and use forward slashes — nix-win
+            deploys xdg trees as home-relative paths.
+          '';
+        })
+        [
+          {
+            name = "configHome";
+            value = cfg.configHome;
+          }
+          {
+            name = "dataHome";
+            value = cfg.dataHome;
+          }
+        ];
+
     home.file = lib.mkMerge [
       (forward cfg.configHome cfg.configFile)
       (forward cfg.dataHome cfg.dataFile)

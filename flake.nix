@@ -138,8 +138,19 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
 
+          # A trivial "installed program" payload. Exercises the packages
+          # staging path — which MUST be combined with files entries in the
+          # same eval: the packages tree merges over the files tree at
+          # toplevel assembly, and a broken merge once silently dropped
+          # every package payload while the build stayed green.
+          checkPkg = pkgs.runCommand "check-pkg" { } ''
+            mkdir -p $out/bin
+            echo packaged > $out/bin/check-tool.txt
+          '';
+
           # A representative minimal system: exercises the module list, the
-          # file tree builder, the activation DAG, and the toplevel assembly.
+          # file tree builder, the packages merge, the activation DAG, and
+          # the toplevel assembly.
           minimal = self.lib.winSystem {
             inherit pkgs;
             modules = [
@@ -147,13 +158,15 @@
                 system.primaryUser = "alice";
                 environment.files."nix-win/eval-check.txt".text = "nix-win eval check";
                 environment.files."nix-win/check.ps1".text = "Write-Host 'crlf check'";
+                environment.systemPackages = [ checkPkg ];
               }
             ];
           };
 
           # Minimal per-user configuration: exercises home.file (text +
-          # source + executable), xdg.configFile, sessionPath/-Variables,
-          # the activation DAG, and activationPackage assembly.
+          # source + executable), home.packages (merged over the files
+          # tree), xdg.configFile, sessionPath/-Variables, the activation
+          # DAG, and activationPackage assembly.
           homeMinimal = self.lib.winHomeConfiguration {
             inherit pkgs;
             modules = [
@@ -165,6 +178,7 @@
                   text = "print('x')";
                   executable = true;
                 };
+                home.packages = [ checkPkg ];
                 xdg.configFile."app/settings.json".text = ''{ "a": 1 }'';
                 home.sessionPath = [ "%USERPROFILE%\\.local\\bin" ];
                 home.sessionVariables.NIX_WIN_CHECK = "1";
@@ -250,6 +264,7 @@
                     home.stateVersion = "0.2";
                     home.file.".config/nix-win/integrated-check.txt".text =
                       "primary user is ${toString osConfig.system.primaryUser}";
+                    home.packages = [ checkPkg ];
                     home.activation.integratedCheck = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
                       Write-Host "integrated check"
                     '';
@@ -280,10 +295,34 @@
         in
         {
           # Real evaluation check — building the toplevel forces the whole
-          # module system, not just an echo.
-          eval-minimal = minimal.config.system.build.toplevel;
+          # module system, and the assertions prove the assembled tree
+          # actually carries both the files AND the packages payloads (a
+          # bare build once passed while the packages merge silently
+          # dropped everything).
+          eval-minimal =
+            pkgs.runCommand "nix-win-eval-minimal"
+              {
+                top = minimal.config.system.build.toplevel;
+              }
+              ''
+                set -eu
+                grep -q 'nix-win eval check' "$top/programdata/nix-win/eval-check.txt"
+                grep -q 'packaged' "$top/programdata/nix-win/Programs/check-pkg/bin/check-tool.txt"
+                touch $out
+              '';
 
-          eval-home-minimal = homeMinimal.activationPackage;
+          eval-home-minimal =
+            pkgs.runCommand "nix-win-eval-home-minimal"
+              {
+                ap = homeMinimal.activationPackage;
+              }
+              ''
+                set -eu
+                grep -q 'winHome eval check' "$ap/home/.config/nix-win/home-check.txt"
+                [ -x "$ap/home/bin/tool.py" ]
+                grep -q 'packaged' "$ap/home/AppData/Local/Programs/check-pkg/bin/check-tool.txt"
+                touch $out
+              '';
 
           eval-integrated =
             pkgs.runCommand "nix-win-eval-integrated"
@@ -295,6 +334,7 @@
                 [ -f "$top/users/alice/activate.ps1" ]
                 [ -f "$top/users/alice/manifest.json" ]
                 grep -q 'primary user is alice' "$top/users/alice/home/.config/nix-win/integrated-check.txt"
+                grep -q 'packaged' "$top/users/alice/home/AppData/Local/Programs/check-pkg/bin/check-tool.txt"
                 grep -q '"users":\["alice"\]' "$top/manifest.json"
                 grep -q '"version":2' "$top/manifest.json"
                 grep -q 'integrated check' "$top/users/alice/activate.ps1"
