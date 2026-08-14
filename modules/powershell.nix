@@ -53,10 +53,30 @@ in
           Write-Host "nix-win: installing PowerShell modules..." -ForegroundColor Cyan
           $manifest = Get-Content (Join-Path $env:NIX_WIN_STORE_PATH "powershell\psmodules.json") | ConvertFrom-Json
 
+          # Neither Install-PSResource nor `Install-Module -Force` short-circuits
+          # on "already at this version" — both re-download from the PSGallery and
+          # re-extract over the existing directory. That is pure cost on a
+          # steady-state switch, and re-extraction moves the module directory's
+          # mtime, which invalidates the DSC WindowsPowerShell adapter's
+          # Get-DscResource cache and forces a full (30-60s) module enumeration
+          # inside *every* adapter process for the rest of the run. So gate on the
+          # version already being installed.
+          #
+          # `-Scope AllUsers` writes to <root>\<name>\<version>\, so a Test-Path is
+          # an exact check. It is used in preference to Get-Module -ListAvailable
+          # because pwsh 7 hides Desktop-edition modules (which the DSC resource
+          # modules are) from that cmdlet unless -SkipEditionCheck is passed.
+          $pwsh7Root = Join-Path $env:ProgramFiles "PowerShell\Modules"
+          $winpsRoot = Join-Path $env:ProgramFiles "WindowsPowerShell\Modules"
+
           # Install pwsh7 modules
           foreach ($prop in $manifest.pwsh7.PSObject.Properties) {
               $name = $prop.Name
               $version = $prop.Value
+              if (Test-Path (Join-Path $pwsh7Root "$name\$version")) {
+                  Write-Host "  pwsh7: $name@$version (present)" -ForegroundColor DarkGray
+                  continue
+              }
               Write-Host "  pwsh7: $name@$version" -ForegroundColor Gray
               if (Get-Command Install-PSResource -ErrorAction SilentlyContinue) {
                   Install-PSResource -Name $name -Version $version -Scope AllUsers -TrustRepository -ErrorAction SilentlyContinue
@@ -65,14 +85,19 @@ in
               }
           }
 
-          # Install Windows PowerShell 5.1 modules and remove stale versions
+          # Install Windows PowerShell 5.1 modules and remove stale versions.
+          # Both steps run in a single powershell.exe spawn, and only when the
+          # pinned version is missing.
           foreach ($prop in $manifest.windowsPowerShell.PSObject.Properties) {
               $name = $prop.Name
               $version = $prop.Value
+              if (Test-Path (Join-Path $winpsRoot "$name\$version")) {
+                  Write-Host "  winps: $name@$version (present)" -ForegroundColor DarkGray
+                  continue
+              }
               Write-Host "  winps: $name@$version" -ForegroundColor Gray
-              powershell.exe -NoProfile -Command "Install-Module -Name '$name' -RequiredVersion '$version' -Scope AllUsers -Force -AllowClobber -ErrorAction SilentlyContinue"
-              # Remove other versions to avoid DSC resource resolution conflicts
-              powershell.exe -NoProfile -Command "Get-Module -ListAvailable '$name' | Where-Object { `$_.Version -ne '$version' } | ForEach-Object { Uninstall-Module -Name '$name' -RequiredVersion `$_.Version -Force -ErrorAction SilentlyContinue }"
+              # Stale versions are removed to avoid DSC resource resolution conflicts.
+              powershell.exe -NoProfile -Command "Install-Module -Name '$name' -RequiredVersion '$version' -Scope AllUsers -Force -AllowClobber -ErrorAction SilentlyContinue; Get-Module -ListAvailable '$name' | Where-Object { `$_.Version -ne '$version' } | ForEach-Object { Uninstall-Module -Name '$name' -RequiredVersion `$_.Version -Force -ErrorAction SilentlyContinue }"
           }
         '';
     })
