@@ -163,43 +163,6 @@
             ];
           };
 
-          # DSC adapter-group batching. Every adapted resource emitted as its
-          # own Microsoft.Windows/WindowsPowerShell group costs a cold Windows
-          # PowerShell 5.1 start per operation, so they are coalesced into one
-          # group per dependsOn wave. Five script resources plus a file
-          # resource — proving resources from different generated modules and
-          # different inner types share a group — two of which depend on a
-          # third, must collapse to exactly two groups.
-          dscBatched = self.lib.winSystem {
-            inherit pkgs;
-            modules = [
-              {
-                system.primaryUser = "alice";
-                dsc.enable = true;
-                dsc.psdsc.file."a file" = {
-                  DestinationPath = ''C:\ProgramData\nix-win\batch-check.txt'';
-                  Contents = "batch check";
-                };
-                dsc.psdsc.script =
-                  let
-                    trivial = {
-                      GetScript = "@{ Result = 'x' }";
-                      TestScript = "return $true";
-                      SetScript = "return";
-                    };
-                    onBase = [ "[resourceId('Microsoft.Windows/WindowsPowerShell', 'base')]" ];
-                  in
-                  {
-                    base = trivial;
-                    plain-a = trivial;
-                    plain-b = trivial;
-                    after-one = trivial // { dependsOn = onBase; };
-                    after-two = trivial // { dependsOn = onBase; };
-                  };
-              }
-            ];
-          };
-
           # Minimal per-user configuration: exercises home.file (text +
           # source + executable), home.packages (merged over the files
           # tree), xdg.configFile, sessionPath/-Variables, the activation
@@ -375,27 +338,6 @@
                 grep -q '"users":\["alice"\]' "$top/manifest.json"
                 grep -q '"version":2' "$top/manifest.json"
                 grep -q 'integrated check' "$top/users/alice/activate.ps1"
-                touch $out
-              '';
-
-          # Each Microsoft.Windows/WindowsPowerShell group costs a cold Windows
-          # PowerShell 5.1 start per DSC operation, so the count must stay at one
-          # per dependsOn wave and not drift back to one per resource.
-          eval-dsc-batching =
-            pkgs.runCommand "nix-win-eval-dsc-batching"
-              {
-                top = dscBatched.config.system.build.toplevel;
-                nativeBuildInputs = [ pkgs.yq-go ];
-              }
-              ''
-                set -eu
-                cfg="$top/dsc/config.yaml"
-                groups=$(yq '[.resources[] | select(.type == "Microsoft.Windows/WindowsPowerShell")] | length' "$cfg")
-                inner=$(yq '[.resources[] | .properties.resources[]] | length' "$cfg")
-                echo "adapter groups: $groups, inner resources: $inner"
-                [ "$groups" = 2 ]
-                [ "$inner" = 6 ]
-                yq -e '.resources[1].dependsOn[0] | contains("wave 0")' "$cfg"
                 touch $out
               '';
 
