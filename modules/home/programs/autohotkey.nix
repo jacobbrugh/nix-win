@@ -28,6 +28,21 @@ in
       default = ".config/ahk/main.ahk";
       description = "Target path relative to home directory.";
     };
+
+    relaunchTask = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "Start Autohotkey";
+      description = ''
+        Name of a scheduled task that launches AutoHotkey. When set, the
+        reload activation relaunches via Start-ScheduledTask, which always
+        places the new instance in the user's interactive desktop session.
+        Without this, a switch run from a non-interactive context (SSH,
+        session 0) Start-Processes the replacement into its own session,
+        where it can never receive keyboard input — hotkeys silently die
+        until the next reboot.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -41,13 +56,22 @@ in
       Write-Host "nix-win: reloading AutoHotkey..." -ForegroundColor Cyan
       $ahkProc = Get-Process -Name "AutoHotkey*" -ErrorAction SilentlyContinue
       if ($ahkProc) {
-          $ahkProc | Stop-Process -Force
+          $ahkProc | Stop-Process -Force -ErrorAction SilentlyContinue
           Start-Sleep -Seconds 1
       }
-      $ahkPath = Join-Path $env:USERPROFILE "${lib.replaceStrings [ "/" ] [ "\\" ] cfg.configPath}"
-      $ahkExe = Get-Command autohotkey -ErrorAction SilentlyContinue
-      if ($ahkExe -and (Test-Path $ahkPath)) {
-          Start-Process -FilePath $ahkExe.Source -ArgumentList $ahkPath -WindowStyle Hidden
+      ${
+        if cfg.relaunchTask != null then
+          ''
+            Start-ScheduledTask -TaskName "${cfg.relaunchTask}" -ErrorAction Stop
+          ''
+        else
+          ''
+            $ahkPath = Join-Path $env:USERPROFILE "${lib.replaceStrings [ "/" ] [ "\\" ] cfg.configPath}"
+            $ahkExe = Get-Command autohotkey -ErrorAction SilentlyContinue
+            if ($ahkExe -and (Test-Path $ahkPath)) {
+                Start-Process -FilePath $ahkExe.Source -ArgumentList $ahkPath -WindowStyle Hidden
+            }
+          ''
       }
     '';
   };
