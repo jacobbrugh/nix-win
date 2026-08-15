@@ -10,6 +10,7 @@
   ./system-packages.nix
   ./activation.nix
   ./scoop.nix
+  ./scheduled-tasks.nix
   ./winget.nix
   ./powershell.nix
   ./dsc
