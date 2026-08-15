@@ -153,6 +153,12 @@ in
         description = "Generated scheduled-task declaration (JSON).";
       };
 
+      fileRoots = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        description = "Target roots actually used by environment.files.";
+      };
+
       services = lib.mkOption {
         type = lib.types.nullOr lib.types.package;
         default = null;

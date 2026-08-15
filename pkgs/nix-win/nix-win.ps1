@@ -312,6 +312,11 @@ function Resolve-TargetRoot {
         "appdata-local" { return $env:LOCALAPPDATA }
         "appdata-roaming" { return $env:APPDATA }
         "programdata" { return $env:ProgramData }
+        # The root of the system drive, for machine-scope files that
+        # conventionally live outside %ProgramData% — C:\Scripts and friends.
+        # Kept as a named root rather than allowing arbitrary absolute paths so
+        # the deploy target stays inside a known, enumerable set.
+        "system-drive" { return ($env:SystemDrive + "\") }
         default { throw "Unknown target root: $Root" }
     }
 }
@@ -550,7 +555,10 @@ function Deploy-Files {
     param(
         [string]$WinStorePath,
         [hashtable]$PrevFiles,
-        [string[]]$Roots = @("home", "appdata-local", "appdata-roaming", "programdata"),
+        # Every root Resolve-TargetRoot knows about. A root with no subtree in
+        # the store path is skipped, so listing them all costs nothing and
+        # means a newly-used root does not need a second edit here.
+        [string[]]$Roots = @("home", "appdata-local", "appdata-roaming", "programdata", "system-drive"),
         # Where to back up unmanaged files we're about to overwrite —
         # the invoking scope's generations/<scope>/<gen>/backups. Empty
         # skips backups (rollback re-deploys known-managed trees).
