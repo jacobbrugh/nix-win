@@ -584,7 +584,16 @@ function Invoke-HomeApply {
     $env:NIX_WIN_HOME_STORE_PATH = $HomeWinPath
     $activateScript = Join-Path $HomeWinPath "activate.ps1"
     if (Test-Path $activateScript) {
-        & $activateScript
+        # Out-Host, not a bare call: this function RETURNS a hashtable that
+        # the caller indexes as .files/.links, so anything activate.ps1 emits
+        # on the success stream would be prepended to that return value and
+        # turn it into an array. Under Set-StrictMode that surfaces far from
+        # the cause, as "The property 'files' cannot be found on this object"
+        # at the Save-State call. Activation scripts legitimately print (a
+        # komorebic/scoop/winget invocation whose output isn't redirected is
+        # enough), so the containment belongs here rather than in every
+        # module's activation text.
+        & $activateScript | Out-Host
     }
 
     return @{ files = $newFiles; links = $newLinks }
