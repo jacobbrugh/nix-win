@@ -80,9 +80,96 @@ in
             # switch with a never-closing stdin (e.g. `ssh host 'cmd'` forwarding
             # an open terminal, or a tool that pipes stdin) wedges the adapter
             # here forever at 0% CPU. Config comes from --file, so dsc needs no
-            # real stdin; stdout/stderr stay on the console and still stream.
-            "" | dsc config set --file $dscConfig
+            # real stdin.
+            #
+            # stdout is captured rather than echoed. dsc emits one JSON document
+            # describing every resource, which ran to 64,716 characters here —
+            # 74% of the entire switch log — and said nothing a reader could use,
+            # since a converged resource reports changedProperties: null. Only
+            # stderr still streams, so warnings and progress appear live.
+            $dscOut = "" | dsc config set --file $dscConfig
+            $dscExit = $LASTEXITCODE
             $env:PATH = $prevPath
+
+            # Park the full document next to the generation record. It carries
+            # per-resource durations, which is the only reliable way to attribute
+            # time inside this phase.
+            $dscJson = $null
+            if ($env:NIX_WIN_GENERATION_DIR) {
+                if (-not (Test-Path -LiteralPath $env:NIX_WIN_GENERATION_DIR)) {
+                    New-Item -ItemType Directory -Path $env:NIX_WIN_GENERATION_DIR -Force | Out-Null
+                }
+                $dscJson = Join-Path $env:NIX_WIN_GENERATION_DIR "dsc-result.json"
+                Set-Content -LiteralPath $dscJson -Value ($dscOut | Out-String) -NoNewline
+            }
+
+            # Summarise. Anything that changed or failed gets its own line; the
+            # rest collapse into a count, with the full detail on disk.
+            $doc = $null
+            try { $doc = ($dscOut | Out-String) | ConvertFrom-Json } catch { $doc = $null }
+
+            if ($null -eq $doc) {
+                Write-Warning "nix-win: could not parse the dsc result document."
+                if ($dscJson) { Write-Host "  raw output: $dscJson" -ForegroundColor DarkGray }
+            } else {
+                # A group/adapter resource nests its members under .result, so
+                # flatten rather than assuming one level.
+                $flat = [System.Collections.Generic.List[object]]::new()
+                function Add-DscResults {
+                    param($Nodes)
+                    foreach ($n in $Nodes) {
+                        if ($null -eq $n) { continue }
+                        $names = $n.PSObject.Properties.Name
+                        if ($names -contains 'result' -and $n.result -is [System.Object[]]) {
+                            Add-DscResults -Nodes $n.result
+                        } else {
+                            $flat.Add($n)
+                        }
+                    }
+                }
+                if ($doc.PSObject.Properties.Name -contains 'results') {
+                    Add-DscResults -Nodes $doc.results
+                }
+
+                $changedCount = 0
+                foreach ($r in $flat) {
+                    $rn = $r.PSObject.Properties.Name
+                    $changed = @()
+                    if ($rn -contains 'result' -and $null -ne $r.result -and
+                        ($r.result.PSObject.Properties.Name -contains 'changedProperties') -and
+                        $null -ne $r.result.changedProperties) {
+                        $changed = @($r.result.changedProperties)
+                    }
+                    if ($changed.Count -gt 0) {
+                        $changedCount++
+                        $d = ""
+                        if (($rn -contains 'metadata') -and $null -ne $r.metadata -and
+                            ($r.metadata.PSObject.Properties.Name -contains 'Microsoft.DSC')) {
+                            $d = " $($r.metadata.'Microsoft.DSC'.duration)"
+                        }
+                        Write-Host "  changed $($r.name) [$($r.type)] ($($changed -join ', '))$d" -ForegroundColor Green
+                    }
+                }
+
+                foreach ($m in @($doc.messages)) {
+                    if ($null -ne $m) { Write-Host "  $($m | ConvertTo-Json -Compress -Depth 4)" -ForegroundColor Yellow }
+                }
+
+                $total = ""
+                if (($doc.PSObject.Properties.Name -contains 'metadata') -and
+                    ($doc.metadata.PSObject.Properties.Name -contains 'Microsoft.DSC')) {
+                    $total = " in $($doc.metadata.'Microsoft.DSC'.duration)"
+                }
+                $plural = if ($flat.Count -eq 1) { "resource" } else { "resources" }
+                Write-Host "  $($flat.Count) $plural, $changedCount changed$total" -ForegroundColor DarkGray
+                if ($dscJson) { Write-Host "  full result: $dscJson" -ForegroundColor DarkGray }
+
+                if ($doc.PSObject.Properties.Name -contains 'hadErrors' -and $doc.hadErrors) {
+                    throw "dsc reported errors; see $dscJson"
+                }
+            }
+
+            if ($dscExit -ne 0) { throw "dsc config set exited $dscExit" }
         } else {
             Write-Warning "DSC v3 is not installed. Install via: winget install Microsoft.DSC"
         }
