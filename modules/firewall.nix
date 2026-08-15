@@ -178,18 +178,22 @@ in
         }
 
         foreach ($d in $fwDeclared) {
-            $name = $d.name
-            Invoke-NixWinItem -Name "firewall $name" -Test {
-                if (-not $fwRules.ContainsKey($name)) { return $false }
-                $live = $fwRules[$name]
+            # $fwName, NOT $name: these scriptblocks run inside
+            # Invoke-NixWinItem, whose own [string]$Name parameter would
+            # shadow it (PowerShell variable names are case-insensitive), so
+            # `$name` would resolve to the display label rather than the rule.
+            $fwName = $d.name
+            Invoke-NixWinItem -Name "firewall $fwName" -Test {
+                if (-not $fwRules.ContainsKey($fwName)) { return $false }
+                $live = $fwRules[$fwName]
                 if ("$($live.DisplayName)" -ne "$($d.displayName)") { return $false }
                 if ("$($live.Direction)" -ne "$($d.direction)") { return $false }
                 if ("$($live.Action)" -ne "$($d.action)") { return $false }
                 # Enabled is an enum whose string form is True/False.
                 if ("$($live.Enabled)" -ne 'True') { return $false }
 
-                if ($fwPort.ContainsKey($name)) {
-                    $pf = $fwPort[$name]
+                if ($fwPort.ContainsKey($fwName)) {
+                    $pf = $fwPort[$fwName]
                     if ("$($pf.Protocol)" -ne "$($d.protocol)") { return $false }
                     $wantPorts = @($d.localPort | ForEach-Object { "$_" })
                     $havePorts = @($pf.LocalPort | ForEach-Object { "$_" })
@@ -202,14 +206,14 @@ in
                 }
 
                 if ($null -ne $d.program) {
-                    if (-not $fwApp.ContainsKey($name)) { return $false }
-                    if ("$($fwApp[$name].Program)" -ne "$($d.program)") { return $false }
+                    if (-not $fwApp.ContainsKey($fwName)) { return $false }
+                    if ("$($fwApp[$fwName].Program)" -ne "$($d.program)") { return $false }
                 }
 
                 $wantAddr = @($d.remoteAddress | ForEach-Object { "$_" })
                 if ($wantAddr.Count -gt 0) {
-                    if (-not $fwAddr.ContainsKey($name)) { return $false }
-                    $haveAddr = @($fwAddr[$name].RemoteAddress | ForEach-Object { "$_" })
+                    if (-not $fwAddr.ContainsKey($fwName)) { return $false }
+                    $haveAddr = @($fwAddr[$fwName].RemoteAddress | ForEach-Object { "$_" })
                     if (-not (Test-NixWinSetEqual -A $wantAddr -B $haveAddr)) { return $false }
                 }
                 return $true
@@ -219,12 +223,12 @@ in
                 # an undefined variable, so the loop body never runs and every
                 # unspecified property is silently dropped); recreating from the
                 # full declaration cannot half-apply.
-                if ($fwRules.ContainsKey($name)) {
-                    Remove-NetFirewallRule -Name $name -ErrorAction SilentlyContinue
+                if ($fwRules.ContainsKey($fwName)) {
+                    Remove-NetFirewallRule -Name $fwName -ErrorAction SilentlyContinue
                 }
                 # $fwArgs, not $args: the latter is an automatic variable.
                 $fwArgs = @{
-                    Name        = $name
+                    Name        = $fwName
                     DisplayName = $d.displayName
                     Direction   = $d.direction
                     Action      = $d.action

@@ -87,27 +87,32 @@ in
         foreach ($s in (Get-Service)) { $svcAll[$s.Name] = $s }
 
         foreach ($d in $svcDeclared) {
-            $name = $d.name
-            Invoke-NixWinItem -Name "service $name" -Test {
-                if (-not $svcAll.ContainsKey($name)) {
+            # $svcName, NOT $name: these scriptblocks are invoked from inside
+            # Invoke-NixWinItem, whose own [string]$Name parameter would
+            # otherwise shadow it (PowerShell variable names are
+            # case-insensitive), so `$name` would resolve to the display label
+            # rather than the service.
+            $svcName = $d.name
+            Invoke-NixWinItem -Name "service $svcName" -Test {
+                if (-not $svcAll.ContainsKey($svcName)) {
                     # A service we do not install must exist already; saying so
                     # is far more useful than silently trying to start it.
-                    throw "service '$name' is not installed"
+                    throw "service '$svcName' is not installed"
                 }
-                $live = $svcAll[$name]
+                $live = $svcAll[$svcName]
                 if ("$($live.StartType)" -ne "$($d.startupType)") { return $false }
                 if ("$($live.Status)" -ne "$($d.state)") { return $false }
                 return $true
             } -Set {
-                $live = $svcAll[$name]
+                $live = $svcAll[$svcName]
                 if ("$($live.StartType)" -ne "$($d.startupType)") {
-                    Set-Service -Name $name -StartupType $d.startupType
+                    Set-Service -Name $svcName -StartupType $d.startupType
                 }
                 if ("$($live.Status)" -ne "$($d.state)") {
                     if ($d.state -eq 'Running') {
-                        Start-Service -Name $name
+                        Start-Service -Name $svcName
                     } else {
-                        Stop-Service -Name $name -Force
+                        Stop-Service -Name $svcName -Force
                     }
                 }
             }

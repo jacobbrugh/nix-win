@@ -282,10 +282,15 @@ in
         foreach ($t in (Get-ScheduledTask)) { $stAll[$t.TaskName] = $t }
 
         foreach ($d in $stDeclared) {
-            $name = $d.name
-            Invoke-NixWinItem -Name $name -Test {
-                if (-not $stAll.ContainsKey($name)) { return $false }
-                $live = $stAll[$name]
+            # $taskName, NOT $name: these scriptblocks run inside
+            # Invoke-NixWinItem, whose own [string]$Name parameter shadows any
+            # `$name` here (PowerShell variable names are case-insensitive).
+            # It happens to hold the same value in this step, but relying on
+            # that is a trap the services and firewall steps actually fell into.
+            $taskName = $d.name
+            Invoke-NixWinItem -Name $taskName -Test {
+                if (-not $stAll.ContainsKey($taskName)) { return $false }
+                $live = $stAll[$taskName]
 
                 # Compare ONLY the fields we declare, against the live CIM
                 # object. Do NOT diff the registration XML: Task Scheduler adds
@@ -397,7 +402,7 @@ in
                 $settings = New-ScheduledTaskSettingsSet -MultipleInstances $d.multipleInstances
 
                 $register = @{
-                    TaskName  = $name
+                    TaskName  = $taskName
                     Action    = $action
                     Trigger   = $trigger
                     Principal = $principal
