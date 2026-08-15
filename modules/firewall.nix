@@ -158,14 +158,36 @@ in
         # WMI ASSOCIATORS OF query per filter per rule (eight per rule), while
         # the unfiltered enumerations are one round trip each regardless of
         # how many rules exist.
+        # Errors here are NOT swallowed. Get-NetFirewallPortFilter and
+        # Get-NetFirewallAddressFilter require elevation and fail with "Access
+        # is denied" without it (Get-NetFirewallRule and
+        # Get-NetFirewallApplicationFilter do not). With -ErrorAction
+        # SilentlyContinue the map is simply left empty, and every
+        # `if ($fwPort.ContainsKey(...))` guard then skips its comparison — so
+        # a rule whose port is wrong reports `ok` because nothing looked. That
+        # silent under-checking is worse than the DSC resource this replaces.
+        # Record what could not be read and fail the affected items loudly.
+        $fwLoadErrors = @{}
+        function Get-NixWinFilterMap {
+            param([Parameter(Mandatory)][string]$Cmd, [Parameter(Mandatory)][string]$Kind)
+            $map = @{}
+            try {
+                foreach ($f in (& $Cmd -ErrorAction Stop)) { $map[$f.InstanceID] = $f }
+            } catch {
+                $fwLoadErrors[$Kind] = $_.Exception.Message.Trim()
+            }
+            return $map
+        }
+
         $fwRules = @{}
-        foreach ($r in (Get-NetFirewallRule -ErrorAction SilentlyContinue)) { $fwRules[$r.Name] = $r }
-        $fwPort = @{}
-        foreach ($f in (Get-NetFirewallPortFilter -ErrorAction SilentlyContinue)) { $fwPort[$f.InstanceID] = $f }
-        $fwAddr = @{}
-        foreach ($f in (Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue)) { $fwAddr[$f.InstanceID] = $f }
-        $fwApp = @{}
-        foreach ($f in (Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue)) { $fwApp[$f.InstanceID] = $f }
+        try {
+            foreach ($r in (Get-NetFirewallRule -ErrorAction Stop)) { $fwRules[$r.Name] = $r }
+        } catch {
+            throw "cannot enumerate firewall rules: $($_.Exception.Message.Trim())"
+        }
+        $fwPort = Get-NixWinFilterMap -Cmd 'Get-NetFirewallPortFilter'        -Kind 'port'
+        $fwAddr = Get-NixWinFilterMap -Cmd 'Get-NetFirewallAddressFilter'     -Kind 'address'
+        $fwApp  = Get-NixWinFilterMap -Cmd 'Get-NetFirewallApplicationFilter' -Kind 'application'
 
         # Order-insensitive set comparison. Compare-Object refuses an empty
         # array for -ReferenceObject, and every list here can legitimately be
@@ -192,6 +214,12 @@ in
                 # Enabled is an enum whose string form is True/False.
                 if ("$($live.Enabled)" -ne 'True') { return $false }
 
+                # Protocol/port live on the port filter. If that enumeration
+                # failed, say so rather than reporting converged on a property
+                # nothing examined.
+                if ($fwLoadErrors.ContainsKey('port')) {
+                    throw "cannot read port filters ($($fwLoadErrors['port'])); refusing to report this rule converged"
+                }
                 if ($fwPort.ContainsKey($fwName)) {
                     $pf = $fwPort[$fwName]
                     if ("$($pf.Protocol)" -ne "$($d.protocol)") { return $false }
@@ -203,15 +231,24 @@ in
                     } elseif (-not (Test-NixWinSetEqual -A $wantPorts -B $havePorts)) {
                         return $false
                     }
+                } elseif (@($d.localPort).Count -gt 0) {
+                    # Ports declared but the rule carries no port filter at all.
+                    return $false
                 }
 
                 if ($null -ne $d.program) {
+                    if ($fwLoadErrors.ContainsKey('application')) {
+                        throw "cannot read application filters ($($fwLoadErrors['application']))"
+                    }
                     if (-not $fwApp.ContainsKey($fwName)) { return $false }
                     if ("$($fwApp[$fwName].Program)" -ne "$($d.program)") { return $false }
                 }
 
                 $wantAddr = @($d.remoteAddress | ForEach-Object { "$_" })
                 if ($wantAddr.Count -gt 0) {
+                    if ($fwLoadErrors.ContainsKey('address')) {
+                        throw "cannot read address filters ($($fwLoadErrors['address']))"
+                    }
                     if (-not $fwAddr.ContainsKey($fwName)) { return $false }
                     $haveAddr = @($fwAddr[$fwName].RemoteAddress | ForEach-Object { "$_" })
                     if (-not (Test-NixWinSetEqual -A $wantAddr -B $haveAddr)) { return $false }
