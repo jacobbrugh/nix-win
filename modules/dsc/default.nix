@@ -101,6 +101,26 @@ let
     if ($dscStaged -and -not (Test-Path -LiteralPath $dscStage)) {
         New-Item -ItemType Directory -Path $dscStage -Force | Out-Null
     }
+
+    # PRUNE anything we no longer want. The stage persists across switches, and
+    # DSC_RESOURCE_PATH discovers whatever is in it — so a manifest staged by an
+    # older generation keeps being found long after the config stopped using it.
+    # Concretely: once the last adapted resource was migrated away, a leftover
+    # windowspowershell.dsc.resource.json + psDscAdapter/ made every switch emit
+    #   WARN Executable 'powershell' not found for operation 'get' ...
+    # four times, because the adapter was still discovered while the PowerShell
+    # directory it needs was (correctly) no longer on the path. Staging that only
+    # ever adds is not idempotent; it accumulates.
+    if ($dscStaged -and (Test-Path -LiteralPath $dscStage)) {
+        $dscKeep = @($dscWanted)
+        ${lib.optionalString needsAdapter ''$dscKeep += 'psDscAdapter' ''}
+        foreach ($existing in (Get-ChildItem -LiteralPath $dscStage -Force)) {
+            if ($dscKeep -notcontains $existing.Name) {
+                Write-Host "  pruning stale staged resource: $($existing.Name)" -ForegroundColor DarkGray
+                Remove-Item -LiteralPath $existing.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
     foreach ($f in $(if ($dscStaged) { $dscWanted } else { @() })) {
         $src = Join-Path $dscPkg $f
         $dst = Join-Path $dscStage $f
