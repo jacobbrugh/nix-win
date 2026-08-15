@@ -9,13 +9,9 @@
 let
   cfg = config.dsc;
 
-  # Collect all resources from sub-modules.
-  # ssh.nix uses its own sshResources option; all generated modules write to
+  # Collect all resources from sub-modules. Generated modules write to
   # nativeResourcesList.
-  allResources =
-    cfg.sshResources
-    ++ cfg.nativeResourcesList
-    ++ cfg.extraResources;
+  allResources = cfg.nativeResourcesList ++ cfg.extraResources;
 
   # Generate DSC v3 YAML document
   dscDocument = {
@@ -155,8 +151,6 @@ let
 in
 {
   imports = [
-    # Hand-written modules (business logic not derivable from schemas)
-    ./ssh.nix
     # Generated modules (from DSC schemas via pkgs/generators/dsc2nix.py)
     ./generated
   ];
@@ -170,12 +164,6 @@ in
       description = "Additional raw DSC resources to include in the configuration.";
     };
 
-    # Internal options for hand-written modules
-    sshResources = lib.mkOption {
-      type = lib.types.listOf lib.types.attrs;
-      default = [ ];
-      internal = true;
-    };
 
     # Populated by all generated modules in ./generated.
     nativeResourcesList = lib.mkOption {

@@ -31,7 +31,8 @@ let
 
   builtFiles = lib.mapAttrs buildFile enabledFiles;
 
-  # Assemble all files into the programdata/ tree
+  # Assemble all files into one tree per target root. The CLI copies each
+  # <root>/ subtree to the directory Resolve-TargetRoot returns for it.
   filesDerivation = pkgs.runCommand "win-files" { } (
     ''
       mkdir -p $out
@@ -40,8 +41,9 @@ let
       lib.mapAttrsToList (
         name: built:
         let
-          targetDir = "$out/programdata/${builtins.dirOf name}";
-          targetFile = "$out/programdata/${name}";
+          root = enabledFiles.${name}.targetRoot;
+          targetDir = "$out/${root}/${builtins.dirOf name}";
+          targetFile = "$out/${root}/${name}";
         in
         ''
           mkdir -p "${targetDir}"
@@ -55,24 +57,33 @@ let
   # Generate manifest.json entries for state tracking
   manifestEntries = lib.mapAttrsToList (name: entry: {
     path = name;
-    targetRoot = "programdata";
-    lineEnding = entry.lineEnding;
-    executable = entry.executable;
+    inherit (entry) targetRoot lineEnding executable;
   }) enabledFiles;
+
+  # Roots actually used, so the CLI knows which subtrees to walk.
+  usedRoots = lib.unique (lib.mapAttrsToList (_: e: e.targetRoot) enabledFiles);
 in
 {
   options.environment.files = lib.mkOption {
-    type = (import ./shared/file-type.nix { inherit lib; }) { includeTargetRoot = false; };
+    type = (import ./shared/file-type.nix { inherit lib; }) {
+      includeTargetRoot = true;
+      # Machine scope, so %ProgramData% rather than the per-user home the
+      # shared submodule otherwise defaults to.
+      defaultTargetRoot = "programdata";
+    };
     default = { };
     description = ''
-      Machine-scope files, placed under %ProgramData%. The per-user
-      analog is `home.file` in the winHome class.
+      Machine-scope files. `targetRoot` defaults to `programdata`, the honest
+      machine-config root on Windows; `system-drive` covers the places that
+      conventionally sit outside it. The per-user analog is `home.file` in the
+      winHome class.
     '';
   };
 
   config = {
     system.build.files = filesDerivation;
     system.build.fileManifest = manifestEntries;
+    system.build.fileRoots = usedRoots;
 
     # Register file copy activation script
     system.activationScripts.files.text = ''

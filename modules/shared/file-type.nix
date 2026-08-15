@@ -18,6 +18,9 @@
   # full root enum; scopes with a fixed root (the per-user home tree) hide the
   # option entirely.
   includeTargetRoot ? true,
+  # Which root an entry lands under when it does not say. The per-user tree
+  # wants "home"; the machine-scope tree wants "programdata".
+  defaultTargetRoot ? "home",
   # Emit the home-manager-compatible field set. Requires pkgs (for the
   # text → source default via writeTextFile).
   hmCompat ? false,
@@ -162,9 +165,15 @@ lib.types.attrsOf (
             "appdata-local"
             "appdata-roaming"
             "programdata"
+            "system-drive"
           ];
-          default = "home";
-          description = "Base directory on Windows where this file is placed.";
+          default = defaultTargetRoot;
+          description = ''
+            Base directory on Windows where this file is placed.
+            `system-drive` is the root of %SystemDrive% (normally `C:\`), for
+            machine-scope files that conventionally live outside
+            %ProgramData%.
+          '';
         };
       };
 

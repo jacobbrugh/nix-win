@@ -16,5 +16,6 @@
   ./scheduled-tasks.nix
   ./winget.nix
   ./powershell.nix
+  ./programs/openssh.nix
   ./dsc
 ]
