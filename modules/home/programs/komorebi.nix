@@ -152,24 +152,54 @@ in
         # old fallback path until it is relaunched (e.g. via its AtLogon
         # task); reload alone cannot repoint it. The same is true of
         # monitor/workspace/bar topology — hence relaunchTask.
-        home.activation.reloadKomorebi = lib.hm.dag.entryAfter [ "writeBoundary" ] (
-          if cfg.relaunchTask != null then
-            ''
-              Write-Host "nix-win: restarting Komorebi..." -ForegroundColor Cyan
-              if (Get-Command komorebic -ErrorAction SilentlyContinue) {
-                  komorebic stop --bar 2>$null
-                  Start-Sleep -Seconds 2
-                  Start-ScheduledTask -TaskName "${cfg.relaunchTask}" -ErrorAction Stop
+        home.activation.reloadKomorebi =
+          let
+            # Exactly the files this module deploys into configHome, taken from
+            # the declarations themselves so the gate below cannot drift from
+            # what is actually written.
+            managed = lib.filter (n: lib.hasPrefix "${cfg.configHome}/" n) (
+              builtins.attrNames config.home.file
+            );
+            psList = lib.concatMapStringsSep ", " (
+              n: "(Join-Path $env:USERPROFILE '${lib.replaceStrings [ "/" ] [ "\\" ] n}')"
+            ) managed;
+          in
+          lib.hm.dag.entryAfter [ "writeBoundary" ] ''
+            # Reload/restart only when one of the deployed config files actually
+            # changed. This ran unconditionally, so every switch tore the window
+            # manager down — with relaunchTask set that is `komorebic stop --bar`
+            # plus a 2 s sleep plus a task start — to re-read byte-identical
+            # files.
+            #
+            # An `if`, not an early `return`: activation entries are concatenated
+            # into one script, so a top-level `return` would abandon every entry
+            # after this one.
+            $komorebiFiles = @(${psList})
+            if ($komorebiFiles.Count -gt 0 -and -not (Test-NixWinFileChanged -Path $komorebiFiles)) {
+                Write-Host "nix-win: Komorebi config unchanged, left alone." -ForegroundColor DarkGray
+            } elseif (-not (Get-Command komorebic -ErrorAction SilentlyContinue)) {
+                Write-Host "nix-win: komorebic not found, skipping Komorebi reload." -ForegroundColor DarkYellow
+            } else {
+              ${
+                if cfg.relaunchTask != null then
+                  ''
+                    Write-Host "nix-win: restarting Komorebi..." -ForegroundColor Cyan
+                    # Keep komorebic's output instead of discarding it; a stop
+                    # that fails is worth seeing before we start the task again.
+                    $komoOut = (komorebic stop --bar 2>&1 | Out-String).Trim()
+                    if ($komoOut) { Write-Host "  $komoOut" -ForegroundColor DarkGray }
+                    Start-Sleep -Seconds 2
+                    Start-ScheduledTask -TaskName "${cfg.relaunchTask}" -ErrorAction Stop
+                  ''
+                else
+                  ''
+                    Write-Host "nix-win: reloading Komorebi..." -ForegroundColor Cyan
+                    $komoOut = (komorebic reload-configuration 2>&1 | Out-String).Trim()
+                    if ($komoOut) { Write-Host "  $komoOut" -ForegroundColor DarkGray }
+                  ''
               }
-            ''
-          else
-            ''
-              Write-Host "nix-win: reloading Komorebi..." -ForegroundColor Cyan
-              if (Get-Command komorebic -ErrorAction SilentlyContinue) {
-                  komorebic reload-configuration 2>$null
-              }
-            ''
-        );
+            }
+          '';
       }
     ]
   );

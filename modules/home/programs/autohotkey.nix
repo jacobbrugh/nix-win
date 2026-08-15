@@ -53,25 +53,37 @@ in
     ];
 
     home.activation.reloadAutohotkey = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
-      Write-Host "nix-win: reloading AutoHotkey..." -ForegroundColor Cyan
+      # Reload only when the deployed script actually changed, or when nothing
+      # is running. This used to fire unconditionally, so every switch killed
+      # AutoHotkey, slept a second and relaunched it — dropping every hotkey
+      # mid-switch in order to reload a byte-identical file.
+      #
+      # Note this is an `if`, not an early `return`: activation entries are
+      # concatenated into one script, so a top-level `return` would abandon
+      # every entry that follows, not just this one.
+      $ahkPath = Join-Path $env:USERPROFILE "${lib.replaceStrings [ "/" ] [ "\\" ] cfg.configPath}"
       $ahkProc = Get-Process -Name "AutoHotkey*" -ErrorAction SilentlyContinue
-      if ($ahkProc) {
-          $ahkProc | Stop-Process -Force -ErrorAction SilentlyContinue
-          Start-Sleep -Seconds 1
-      }
-      ${
-        if cfg.relaunchTask != null then
-          ''
-            Start-ScheduledTask -TaskName "${cfg.relaunchTask}" -ErrorAction Stop
-          ''
-        else
-          ''
-            $ahkPath = Join-Path $env:USERPROFILE "${lib.replaceStrings [ "/" ] [ "\\" ] cfg.configPath}"
-            $ahkExe = Get-Command autohotkey -ErrorAction SilentlyContinue
-            if ($ahkExe -and (Test-Path $ahkPath)) {
-                Start-Process -FilePath $ahkExe.Source -ArgumentList $ahkPath -WindowStyle Hidden
-            }
-          ''
+      if ($ahkProc -and -not (Test-NixWinFileChanged -Path $ahkPath)) {
+          Write-Host "nix-win: AutoHotkey config unchanged, left running." -ForegroundColor DarkGray
+      } else {
+          Write-Host "nix-win: reloading AutoHotkey..." -ForegroundColor Cyan
+          if ($ahkProc) {
+              $ahkProc | Stop-Process -Force -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds 1
+          }
+          ${
+            if cfg.relaunchTask != null then
+              ''
+                Start-ScheduledTask -TaskName "${cfg.relaunchTask}" -ErrorAction Stop
+              ''
+            else
+              ''
+                $ahkExe = Get-Command autohotkey -ErrorAction SilentlyContinue
+                if ($ahkExe -and (Test-Path $ahkPath)) {
+                    Start-Process -FilePath $ahkExe.Source -ArgumentList $ahkPath -WindowStyle Hidden
+                }
+              ''
+          }
       }
     '';
   };
