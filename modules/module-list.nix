@@ -5,6 +5,8 @@
   ./users.nix
   ./misc/assertions.nix
   ./networking.nix
+  ./firewall.nix
+  ./services.nix
   ./home-manager.nix
   ./environment-files.nix
   ./system-packages.nix
