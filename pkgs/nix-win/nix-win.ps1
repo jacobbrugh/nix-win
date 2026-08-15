@@ -476,13 +476,19 @@ function Deploy-Files {
         # Where to back up unmanaged files we're about to overwrite —
         # the invoking scope's generations/<scope>/<gen>/backups. Empty
         # skips backups (rollback re-deploys known-managed trees).
-        [string]$BackupDir
+        [string]$BackupDir,
+        # Set when this scope's store path is identical to the one the last
+        # successful deploy recorded. Every source file is then byte-identical
+        # to what we already wrote, which is what makes the skip below sound.
+        [switch]$SourceUnchanged
     )
 
     $newFiles = @{}
 
     # Enumerate incoming deployments up front: feeds both the stale sweep
-    # and the deploy pass.
+    # and the deploy pass. $WinStorePath is a \\wsl$ UNC path, so this walks
+    # the 9p bridge — but it reads metadata only (~0.3 s for 159 files),
+    # against ~8 s to stream the contents.
     $incoming = foreach ($root in $Roots) {
         $sourceDir = Join-Path $WinStorePath $root
         if (-not (Test-Path $sourceDir)) { continue }
@@ -490,9 +496,11 @@ function Deploy-Files {
         foreach ($file in Get-ChildItem -Path $sourceDir -Recurse -File) {
             $relativePath = $file.FullName.Substring($sourceDir.Length + 1)
             [pscustomobject]@{
-                Source       = $file.FullName
-                RelativePath = $relativePath
-                TargetPath   = Join-Path $baseTarget $relativePath
+                Source           = $file.FullName
+                RelativePath     = $relativePath
+                TargetPath       = Join-Path $baseTarget $relativePath
+                Length           = $file.Length
+                LastWriteTimeUtc = $file.LastWriteTimeUtc
             }
         }
     }
@@ -515,16 +523,43 @@ function Deploy-Files {
     }
     Sweep-StaleFiles -Directories @($sweepDirs)
 
+    $skipped = 0
     foreach ($entry in $incoming) {
         $targetPath = $entry.TargetPath
         $targetDir = Split-Path $targetPath -Parent
+        $fileKey = $targetPath.Replace('\', '/')
+
+        # Skip files already deployed from this exact store path and untouched
+        # since. Copy-Item preserves the source's timestamp, and nix
+        # canonicalises every store file's mtime to 1970-01-01T00:00:01Z, so a
+        # target still carrying that stamp at the same length is provably the
+        # copy we wrote; anything that rewrote it (a user edit, or CPython
+        # regenerating a deployed __pycache__/*.pyc) stamps it with a real
+        # time and gets re-copied.
+        #
+        # The $SourceUnchanged gate is load-bearing and must not be dropped:
+        # across DIFFERENT store paths this test is unsound, because that
+        # canonical mtime is a constant. Two builds of the same file always
+        # compare equal on mtime, so a same-length edit — bumping "1.2.3" to
+        # "1.2.4" in a config file is the everyday case — would look identical
+        # and never be deployed. Only when the store path is unchanged does
+        # "matches its source" actually mean "up to date".
+        if ($SourceUnchanged) {
+            $existing = [System.IO.FileInfo]::new($targetPath)
+            if ($existing.Exists -and
+                $existing.Length -eq $entry.Length -and
+                $existing.LastWriteTimeUtc -eq $entry.LastWriteTimeUtc) {
+                $newFiles[$fileKey] = @{ status = "managed" }
+                $skipped++
+                continue
+            }
+        }
 
         if (-not (Test-Path $targetDir)) {
             New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
         }
 
         # Backup existing file if not previously managed
-        $fileKey = $targetPath.Replace('\', '/')
         if ($BackupDir -and (Test-Path $targetPath) -and -not $PrevFiles.ContainsKey($fileKey)) {
             if (-not (Test-Path $BackupDir)) {
                 New-Item -ItemType Directory -Path $BackupDir -Force | Out-Null
@@ -536,6 +571,12 @@ function Deploy-Files {
         Copy-FileRobust -Source $entry.Source -Destination $targetPath
         $newFiles[$fileKey] = @{ status = "managed" }
         Write-Host "  $($entry.RelativePath) -> $targetPath" -ForegroundColor DarkGray
+    }
+
+    # Every file that was actually written is reported above, individually.
+    # This only accounts for the ones that needed no work.
+    if ($skipped -gt 0) {
+        Write-Host "  $skipped file(s) already up to date" -ForegroundColor DarkGray
     }
 
     return $newFiles
@@ -686,11 +727,15 @@ function Invoke-HomeApply {
         [hashtable]$PrevLinks = @{},
         # Omitted on rollback: re-deploying a known-managed tree backs
         # nothing up.
-        [string]$BackupDir
+        [string]$BackupDir,
+        # See Deploy-Files: set only when this home scope's store path is
+        # unchanged since the last successful deploy.
+        [switch]$SourceUnchanged
     )
 
     Write-Host "`nnix-win: deploying home files..." -ForegroundColor Cyan
-    $newFiles = Deploy-Files -WinStorePath $HomeWinPath -PrevFiles $PrevFiles -Roots @("home") -BackupDir $BackupDir
+    $newFiles = Deploy-Files -WinStorePath $HomeWinPath -PrevFiles $PrevFiles -Roots @("home") `
+        -BackupDir $BackupDir -SourceUnchanged:$SourceUnchanged
 
     Write-Host "`nnix-win: deploying home links..." -ForegroundColor Cyan
     $newLinks = Deploy-Links -WinStorePath $HomeWinPath -PrevLinks $PrevLinks
@@ -733,7 +778,8 @@ function Invoke-HomeSwitch {
         -ManifestPath (Join-Path $build.WinPath "manifest.json")
 
     $result = Invoke-HomeApply -HomeWinPath $build.WinPath -PrevFiles $prevFiles -PrevLinks $prevLinks `
-        -BackupDir (Join-Path $genDir "backups")
+        -BackupDir (Join-Path $genDir "backups") `
+        -SourceUnchanged:($state.storePath -eq $build.StorePath -and $prevFiles.Count -gt 0)
 
     Save-State @{
         currentGeneration = $script:NewGeneration
@@ -767,7 +813,8 @@ function Invoke-Switch {
 
     Write-Host "`nnix-win: deploying files..." -ForegroundColor Cyan
     $newFiles = Deploy-Files -WinStorePath $build.WinPath -PrevFiles $prevFiles `
-        -BackupDir (Join-Path $genDir "backups")
+        -BackupDir (Join-Path $genDir "backups") `
+        -SourceUnchanged:($state.storePath -eq $build.StorePath -and $prevFiles.Count -gt 0)
 
     Write-Host "`nnix-win: deploying links..." -ForegroundColor Cyan
     $newLinks = Deploy-Links -WinStorePath $build.WinPath -PrevLinks $prevLinks
@@ -856,7 +903,8 @@ function Invoke-Switch {
             -ManifestPath (Join-Path $userDir "manifest.json")
 
         $homeResult = Invoke-HomeApply -HomeWinPath $userDir -PrevFiles $homePrevFiles -PrevLinks $homePrevLinks `
-            -BackupDir (Join-Path $homeGenDir "backups")
+            -BackupDir (Join-Path $homeGenDir "backups") `
+            -SourceUnchanged:($homeState.storePath -eq $homeStorePath -and $homePrevFiles.Count -gt 0)
 
         Save-State -Path $homeStateFile -State @{
             currentGeneration = $homeGen
