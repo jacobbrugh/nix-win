@@ -95,15 +95,48 @@ in
             $previouslyManaged = if ($raw -isnot [array]) { @($raw) } else { $raw }
         }
 
-        # Read the current user PATH raw (no expansion) so we can rewrite
-        # it in the same REG_EXPAND_SZ form.
+        # Read the current user PATH raw (no expansion) so we can rewrite it in
+        # the same REG_EXPAND_SZ form, and so the strip below can recognise its
+        # own entries.
+        #
+        # This MUST NOT use Get-ItemProperty: that expands REG_EXPAND_SZ. With
+        # expansion, $currentRaw held `C:\Users\<me>\.local\bin` while $desired
+        # and $previouslyManaged hold `%USERPROFILE%\.local\bin`, so the strip
+        # never matched, the already-expanded managed entries survived into
+        # $base, and the %USERPROFILE% forms were prepended on top — leaving
+        # every managed directory in PATH twice, in two forms. Being
+        # string-distinct, it also defeated a naive duplicate check. And since
+        # $newPath (raw form) was compared against $currentRaw (expanded form),
+        # they never matched either, so the value was rewritten and a
+        # WM_SETTINGCHANGE broadcast on every single switch; "user PATH already
+        # up to date" below was unreachable.
         $envKey = 'HKCU:\Environment'
-        $currentRaw = (Get-ItemProperty -Path $envKey -Name Path -ErrorAction SilentlyContinue).Path
+        $envRead = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment')
+        try {
+            $currentRaw = if ($envRead) {
+                [string]$envRead.GetValue('Path', "", 'DoNotExpandEnvironmentNames')
+            } else { "" }
+        } finally { if ($envRead) { $envRead.Close() } }
         if (-not $currentRaw) { $currentRaw = ''' }
         $currentItems = @($currentRaw -split ';' | Where-Object { $_ })
 
         # Strip entries nix-win added last generation; anything else survives.
-        $base = @($currentItems | Where-Object { $previouslyManaged -notcontains $_ })
+        #
+        # Compare *expanded*, so this also cleans up after the bug above: PATHs
+        # written before the raw-read fix carry each managed directory twice,
+        # once as `%USERPROFILE%\...` and once as the expanded
+        # `C:\Users\<me>\...`. A literal match would only ever strip the former
+        # and leave the latter as permanent cruft. Expanding both sides removes
+        # either spelling, and $desired is re-prepended below in the declared
+        # form, so the result converges to exactly one copy.
+        $managedExpanded = @(
+            @($previouslyManaged) + @($desired) |
+                Where-Object { $_ } |
+                ForEach-Object { [Environment]::ExpandEnvironmentVariables($_) }
+        )
+        $base = @($currentItems | Where-Object {
+            $managedExpanded -notcontains [Environment]::ExpandEnvironmentVariables($_)
+        })
 
         $merged = @()
         foreach ($e in $desired) { if ($merged -notcontains $e) { $merged += $e } }
