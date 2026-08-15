@@ -30,7 +30,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0, Mandatory)]
-    [ValidateSet("build", "switch", "rollback", "list-generations", "gc")]
+    [ValidateSet("build", "switch", "rollback", "list-generations", "gc", "update-input")]
     [string]$Command,
 
     [Parameter()]
@@ -50,7 +50,32 @@ param(
     [string]$WslUser = $env:USERNAME,
 
     [Parameter()]
-    [int]$Keep = 5
+    [int]$Keep = 5,
+
+    # Build against a LOCAL checkout of a flake input instead of whatever the
+    # lock file pins. Repeatable: -InputOverride nix-win=C:\repos\nix-win
+    #
+    # Each value is `<input>=<location>` — or just `<location>`, which is
+    # shorthand for `nix-win=<location>`, the overwhelmingly common case when
+    # iterating on nix-win itself.
+    #
+    # <location> may be a Windows path (C:\repos\nix-win), optionally suffixed
+    # with `#<rev-or-ref>`, a \\wsl$ UNC path, a bare WSL path, or any flakeref
+    # nix understands (github:owner/repo, git+ssh://…), which is passed through
+    # untouched.
+    #
+    # A Windows path is mirrored onto ext4 and handed to nix as a git+file:
+    # ref, so what gets built is that checkout's committed HEAD — exactly what
+    # you would get by pushing the commit and bumping the lock, without doing
+    # either.
+    [Parameter()]
+    [Alias("NixWinFlakeOverride", "Override")]
+    [string[]]$InputOverride = @(),
+
+    # `update-input`: which input to update. Defaults to nix-win.
+    # NOT named $Input — that is an automatic variable holding the pipeline.
+    [Parameter()]
+    [string]$InputName = "nix-win"
 )
 
 $ErrorActionPreference = 'Stop'
@@ -233,8 +258,14 @@ function Invoke-NixBuild {
     # would otherwise throw a generic "wsl.exe exited with code N" at the
     # assignment. nix's own error has already streamed to the console above, so
     # "See the build log above" is accurate.
+    # --override-input pairs, quoted for the bash -c that runs them.
+    $overrides = ""
+    if ($script:OverrideArgs.Count -gt 0) {
+        $overrides = " " + (($script:OverrideArgs | ForEach-Object { "'$_'" }) -join ' ')
+    }
+
     $PSNativeCommandUseErrorActionPreference = $false
-    $output = wsl.exe -d $WslDistro -u $WslUser -- bash -c "nix build '$Uri' --no-link --print-out-paths --no-write-lock-file"
+    $output = wsl.exe -d $WslDistro -u $WslUser -- bash -c "nix build '$Uri' --no-link --print-out-paths --no-write-lock-file$overrides"
     if ($LASTEXITCODE -ne 0) {
         throw "nix build failed (exit $LASTEXITCODE). See the build log above."
     }
@@ -778,13 +809,153 @@ function Sync-SourceToStage {
             [Text.Encoding]::UTF8.GetBytes($wslSrc))).Substring(0, 16).ToLower()
     $base = (Invoke-Wsl "printf %s `"`$HOME/.cache/nix-win/stage`"") -join ''
     $stage = "$base/$key"
-    $marker = "$base/$key.built"
+    # The marker is per (source, override set). A build with an override
+    # produces a different store path from one without, so they must not share
+    # a marker — otherwise flipping the override off would "reuse" the
+    # overridden path and report a no-op.
+    $markerKey = if ($script:OverrideKey) { "$key.$($script:OverrideKey)" } else { $key }
+    $marker = "$base/$markerKey.built"
 
     $excl = ($script:StageExcludes | ForEach-Object { "--exclude '$_'" }) -join ' '
     $out = Invoke-Wsl "mkdir -p '$stage' && rsync -ai --delete $excl '$wslSrc/' '$stage/'"
     $changed = @($out | Where-Object { "$_".Trim() }).Count -gt 0
 
     return @{ FlakeRef = "path:$stage"; Changed = $changed; Marker = $marker }
+}
+
+# ── Local flake-input overrides ────────────────────────────────────────────
+#
+# Iterating on nix-win itself used to mean: commit, push, `nix flake update
+# nix-win` in the dotfiles checkout (from inside WSL, by hand), then switch.
+# Three steps and a push per attempt, on a repo you are actively debugging.
+#
+# `-InputOverride` collapses that to one flag pointing at a local checkout.
+# The awkward part is the WSL boundary, and it is handled here rather than
+# left to the caller:
+#
+#   * The checkout is a Windows path. Handing nix a `git+file:///mnt/c/...`
+#     ref makes the daemon read the repo over the 9p bridge — the same
+#     bottleneck the source staging exists to avoid, and worse for a git repo
+#     because it walks .git object by object. So the checkout is mirrored onto
+#     ext4 first, exactly like the dotfiles source.
+#   * .git is deliberately INCLUDED in this mirror (unlike the source stage,
+#     which excludes it): the whole point is to resolve the checkout's HEAD
+#     commit, which needs git metadata.
+#   * The result is a `git+file:` ref, not `path:`, so nix builds the committed
+#     HEAD rather than the working tree. That makes an override behave exactly
+#     like the push-then-bump-the-lock flow it replaces — a half-saved file
+#     cannot silently end up in the build.
+$script:OverrideStageExcludes = @('.direnv', 'result')
+
+function Resolve-InputOverride {
+    param([Parameter(Mandatory)][string]$Spec)
+
+    # `<input>=<location>`, or bare `<location>` meaning nix-win. Split on the
+    # FIRST '=', and only when the left side looks like an input name — a
+    # Windows path can contain '=' in principle and must not be mis-split.
+    $inputName = 'nix-win'
+    $location = $Spec
+    if ($Spec -match '^([A-Za-z][A-Za-z0-9_.-]*)=(.+)$') {
+        $inputName = $Matches[1]
+        $location = $Matches[2]
+    }
+
+    # A flakeref nix already understands passes straight through.
+    if ($location -match '^[a-z+]+:' -and $location -notmatch '^[A-Za-z]:[\\/]') {
+        return @{ Name = $inputName; Ref = $location; Source = $location }
+    }
+
+    # Optional `#<rev-or-ref>` suffix. '#' rather than ':' because ':' is
+    # already the drive separator in every Windows path.
+    $rev = $null
+    if ($location -match '^(.*)#([^#]+)$') {
+        $location = $Matches[1]
+        $rev = $Matches[2]
+    }
+
+    # Bare WSL path, or \\wsl$ UNC: already on ext4, no mirror needed.
+    $wslSrc = $null
+    if ($location -match '^\\\\wsl(?:\$|\.localhost)\\[^\\]+\\(.*)$') {
+        $wslSrc = "/$($Matches[1] -replace '\\', '/')"
+    } elseif ($location -match '^/') {
+        $wslSrc = $location
+    }
+
+    if ($null -ne $wslSrc) {
+        $ref = "git+file://$wslSrc"
+        if ($rev) { $ref = "$ref`?rev=$rev" }
+        return @{ Name = $inputName; Ref = $ref; Source = $location }
+    }
+
+    # Windows path: must exist, must be a git repo, gets mirrored to ext4.
+    if (-not (Test-Path -LiteralPath $location)) {
+        throw "-InputOverride: no such path: $location"
+    }
+    $full = (Resolve-Path -LiteralPath $location).Path
+    if (-not (Test-Path -LiteralPath (Join-Path $full '.git'))) {
+        throw "-InputOverride: $full is not a git checkout (no .git). An override is built from its committed HEAD, so it has to be one."
+    }
+
+    $srcWsl = (wsl.exe -d $WslDistro -- wslpath -a ($full.Replace('\', '/')) 2>$null).Trim()
+    if (-not $srcWsl) { throw "-InputOverride: could not translate to a WSL path: $full" }
+
+    $key = [Convert]::ToHexString(
+        [System.Security.Cryptography.SHA256]::HashData(
+            [Text.Encoding]::UTF8.GetBytes($srcWsl))).Substring(0, 16).ToLower()
+    $base = (Invoke-Wsl "printf %s `"`$HOME/.cache/nix-win/override`"") -join ''
+    $stage = "$base/$key"
+
+    $excl = ($script:OverrideStageExcludes | ForEach-Object { "--exclude '$_'" }) -join ' '
+    Write-Host "  mirroring $full -> $stage" -ForegroundColor DarkGray
+    Invoke-Wsl "mkdir -p '$stage' && rsync -a --delete $excl '$srcWsl/' '$stage/'" | Out-Null
+
+    # Warn loudly about uncommitted work: it is NOT in the build, and silently
+    # building something other than what is on screen is the worst possible
+    # behaviour for a debugging aid.
+    $dirty = (Invoke-Wsl "git -C '$stage' status --porcelain 2>/dev/null | head -c 400") -join "`n"
+    if ("$dirty".Trim()) {
+        Write-Host "  WARNING: $full has uncommitted changes; the override builds its committed HEAD, so they are NOT included." -ForegroundColor Yellow
+    }
+
+    $head = (Invoke-Wsl "git -C '$stage' rev-parse HEAD 2>/dev/null" | Select-Object -First 1)
+    $head = "$head".Trim()
+    if (-not $head) { throw "-InputOverride: could not resolve HEAD in $full" }
+
+    $ref = "git+file://$stage"
+    if ($rev) {
+        $ref = "$ref`?rev=$rev"
+        $shown = $rev
+    } else {
+        # Pin the resolved HEAD explicitly. Without it nix resolves the ref
+        # again at build time, so two builds in one session could silently
+        # disagree if a commit landed between them.
+        $ref = "$ref`?rev=$head"
+        $shown = $head.Substring(0, [Math]::Min(12, $head.Length))
+    }
+    Write-Host "  override $inputName -> $full @ $shown" -ForegroundColor DarkGray
+    return @{ Name = $inputName; Ref = $ref; Source = $full }
+}
+
+# Resolved once, then reused by every nix invocation in this run.
+$script:OverrideArgs = @()
+$script:OverrideKey = ""
+
+function Initialize-InputOverrides {
+    if ($InputOverride.Count -eq 0) { return }
+    Write-Host "nix-win: resolving flake input overrides..." -ForegroundColor Cyan
+    $parts = @()
+    foreach ($spec in $InputOverride) {
+        $o = Resolve-InputOverride -Spec $spec
+        $script:OverrideArgs += @('--override-input', $o.Name, $o.Ref)
+        $parts += "$($o.Name)=$($o.Ref)"
+    }
+    # Folded into the stage marker so a changed override forces a rebuild even
+    # when the dotfiles source itself did not move. Without this, switching
+    # between two nix-win checkouts would reuse the first one's store path and
+    # look like a no-op.
+    $script:OverrideKey = [Convert]::ToHexString(
+        [System.Security.Cryptography.SHA256]::HashData(
+            [Text.Encoding]::UTF8.GetBytes(($parts -join ';')))).Substring(0, 16).ToLower()
 }
 
 function Invoke-Build {
@@ -1132,7 +1303,37 @@ function Invoke-GC {
     Write-Host "nix-win: kept $Keep most recent generations." -ForegroundColor Green
 }
 
+# Update one flake input's lock entry in the flake this invocation points at.
+#
+# Exists so bumping the nix-win pin after pushing does not mean remembering the
+# WSL incantation — the nix CLI lives in the distro, the checkout is a Windows
+# path, and `nix flake update` has to run against the real checkout (not the
+# ext4 mirror) because the point is to WRITE flake.lock where git will see it.
+function Invoke-UpdateInput {
+    if (-not $script:SourceWinPath) {
+        throw "update-input needs a Windows checkout path; pass -FlakeUri C:\path\to\dotfiles (or run from inside it)."
+    }
+    $wslPath = (wsl.exe -d $WslDistro -- wslpath -a ($script:SourceWinPath.Replace('\', '/')) 2>$null).Trim()
+    if (-not $wslPath) { throw "Could not translate to a WSL path: $script:SourceWinPath" }
+
+    Write-Host "nix-win: updating flake input '$InputName' in $script:SourceWinPath ..." -ForegroundColor Cyan
+    $PSNativeCommandUseErrorActionPreference = $false
+    # `nix flake update <input>` is the modern spelling; older nix wants
+    # `nix flake lock --update-input <input>`. Try the former, fall back.
+    wsl.exe -d $WslDistro -u $WslUser -- bash -c "cd '$wslPath' && nix flake update '$InputName'"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "nix-win: retrying with the older --update-input spelling..." -ForegroundColor Yellow
+        wsl.exe -d $WslDistro -u $WslUser -- bash -c "cd '$wslPath' && nix flake lock --update-input '$InputName'"
+        if ($LASTEXITCODE -ne 0) { throw "nix flake update failed (exit $LASTEXITCODE)." }
+    }
+    Write-Host "nix-win: '$InputName' updated. Review the flake.lock diff, then switch." -ForegroundColor Green
+}
+
 # ── Main ───────────────────────────────────────────────────────────────────
+
+# Must precede any build: the resolved overrides feed both the nix invocation
+# and the stage marker.
+if ($Command -in @("build", "switch")) { Initialize-InputOverrides }
 
 switch ($Command) {
     "build" { Invoke-Build | Out-Null }
@@ -1140,4 +1341,5 @@ switch ($Command) {
     "rollback" { Invoke-Rollback }
     "list-generations" { Invoke-ListGenerations }
     "gc" { Invoke-GC }
+    "update-input" { Invoke-UpdateInput }
 }
