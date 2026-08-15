@@ -147,6 +147,12 @@ in
         description = "Generated WinGet package declaration (JSON).";
       };
 
+      scheduledTasks = lib.mkOption {
+        type = lib.types.nullOr lib.types.package;
+        default = null;
+        description = "Generated scheduled-task declaration (JSON).";
+      };
+
       dscConfig = lib.mkOption {
         type = lib.types.nullOr lib.types.package;
         default = null;
@@ -226,6 +232,12 @@ in
     ${lib.optionalString (cfg.build.wingetPackages != null) ''
       mkdir -p $out/winget
       cp ${cfg.build.wingetPackages} $out/winget/packages.json
+    ''}
+
+    # Scheduled tasks
+    ${lib.optionalString (cfg.build.scheduledTasks != null) ''
+      mkdir -p $out/scheduled-tasks
+      cp ${cfg.build.scheduledTasks} $out/scheduled-tasks/tasks.json
     ''}
 
     # DSC

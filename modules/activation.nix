@@ -62,7 +62,54 @@ in
       $ErrorActionPreference = 'Stop'
       Set-StrictMode -Version Latest
 
+      # ── Per-item convergence ──────────────────────────────────────────
+      # Steps that converge many items of one kind (scheduled tasks,
+      # services, firewall rules, scripts) share one process, and this is
+      # what keeps that from becoming a batch.
+      #
+      # Two properties matter, both of which DSC gave us and a naive port
+      # would lose:
+      #
+      #   * Per ITEM reporting. One process is an implementation detail; the
+      #     log must still say what happened to each item individually. A
+      #     step that collapses N items into one line is a regression even
+      #     when it is faster.
+      #   * Per ITEM failure isolation. This script runs under
+      #     $ErrorActionPreference = 'Stop' and Set-StrictMode, so an
+      #     unguarded throw in item 3 of 11 abandons items 4-11 — which DSC
+      #     does not do. Failures are collected and re-thrown once, at
+      #     postActivation, so every item still gets its turn and the switch
+      #     still fails.
+      $script:NixWinFailures = [System.Collections.Generic.List[string]]::new()
+
+      function Invoke-NixWinItem {
+          param(
+              [Parameter(Mandatory)][string]$Name,
+              # Returns $true when the item is already in the desired state.
+              [Parameter(Mandatory)][scriptblock]$Test,
+              [Parameter(Mandatory)][scriptblock]$Set
+          )
+          try {
+              if (& $Test) {
+                  Write-Host "  $Name ok" -ForegroundColor DarkGray
+                  return
+              }
+              $sw = [System.Diagnostics.Stopwatch]::StartNew()
+              & $Set
+              $sw.Stop()
+              Write-Host "  $Name changed ($([int]$sw.Elapsed.TotalMilliseconds) ms)" -ForegroundColor Green
+          } catch {
+              $script:NixWinFailures.Add("$Name`: $($_.Exception.Message)")
+              Write-Host "  $Name FAILED: $($_.Exception.Message)" -ForegroundColor Red
+          }
+      }
+
       ${activationScript}
+
+      if ($script:NixWinFailures.Count -gt 0) {
+          throw "nix-win: $($script:NixWinFailures.Count) item(s) failed to converge:`n  " +
+              ($script:NixWinFailures -join "`n  ")
+      }
 
       Write-Host "nix-win: activation complete." -ForegroundColor Green
     '';
