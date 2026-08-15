@@ -101,6 +101,84 @@ elseif ($FlakeUri -match '^[A-Za-z]:[\\/]' -or $FlakeUri -match '^\\\\') {
 
 $StateDir = Join-Path $env:LOCALAPPDATA "nix-win"
 
+# ── CLI-side phase timing ──────────────────────────────────────────────────
+# The generated activation script times its own phases; this covers the work
+# that happens OUTSIDE it — the WSL build, the file deploy, the link deploy —
+# which together were the majority of a switch and showed up as one opaque
+# block. Records go to the same spool, in the same nine-key schema, with
+# stage = "cli", so they land on the existing dashboard alongside everything
+# else.
+#
+# Deliberately duplicated rather than shared with lib/activation.nix: this is
+# a standalone .ps1 shipped to Windows, not generated from the Nix eval, so it
+# cannot import from the module tree.
+$script:TimingSpool = $null
+function Emit-CliTiming {
+    param(
+        [Parameter(Mandatory)][string]$Step,
+        [Parameter(Mandatory)][double]$DurationMs,
+        [int]$ExitCode = 0,
+        [string]$Generation = ""
+    )
+    try {
+        if ($null -eq $script:TimingSpool) {
+            $candidates = @(
+                (Join-Path $env:ProgramData 'nix-win\activation-timing'),
+                (Join-Path $env:LOCALAPPDATA 'nix-win\activation-timing')
+            )
+            foreach ($dir in $candidates) {
+                try {
+                    if (-not (Test-Path -LiteralPath $dir)) {
+                        New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null
+                    }
+                    $probe = Join-Path $dir 'events.jsonl'
+                    [System.IO.File]::AppendAllText($probe, "")
+                    $script:TimingSpool = $probe
+                    break
+                } catch { continue }
+            }
+            if ($null -eq $script:TimingSpool) { $script:TimingSpool = "" }
+        }
+        if ([string]::IsNullOrEmpty($script:TimingSpool)) { return }
+        $now = [DateTimeOffset]::UtcNow
+        $record = [ordered]@{
+            ts             = $now.ToString('yyyy-MM-ddTHH:mm:ss.fffffffK')
+            time_unix_nano = ($now.ToUnixTimeMilliseconds() * 1000000)
+            host           = $env:COMPUTERNAME.ToLower()
+            generation     = $Generation
+            stage          = 'cli'
+            step           = $Step
+            duration_ms    = [Math]::Round($DurationMs, 3)
+            exit_code      = $ExitCode
+            source         = 'inline'
+        }
+        [System.IO.File]::AppendAllText($script:TimingSpool,
+            ($record | ConvertTo-Json -Compress -Depth 3) + "`n")
+    } catch {
+        # Telemetry must never be able to fail a switch.
+    }
+}
+
+# Run a scriptblock, emit one timing record for it, and return its value.
+function Measure-CliPhase {
+    param(
+        [Parameter(Mandatory)][string]$Step,
+        [Parameter(Mandatory)][scriptblock]$Body,
+        [string]$Generation = ""
+    )
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $result = & $Body
+        $sw.Stop()
+        Emit-CliTiming -Step $Step -DurationMs $sw.Elapsed.TotalMilliseconds -Generation $Generation
+        return $result
+    } catch {
+        $sw.Stop()
+        Emit-CliTiming -Step $Step -DurationMs $sw.Elapsed.TotalMilliseconds -ExitCode 1 -Generation $Generation
+        throw
+    }
+}
+
 # One-time migration from the single-scope v1 layout (state.json +
 # generations/<n>) to the scope-split v2 layout (state.system.json +
 # generations/system/<n>). Everything v1 tracked was applied by an
@@ -704,7 +782,13 @@ function Sync-SourceToStage {
 function Invoke-Build {
     if ($script:SourceWinPath) {
         Write-Host "nix-win: staging source on ext4..." -ForegroundColor Cyan
-        $sync = Sync-SourceToStage -WinRoot $script:SourceWinPath
+        # Timed separately from the nix invocation: source staging and
+        # eval/realize have completely different cost drivers (9p vs the
+        # derivation graph), and reporting them as one number is what made the
+        # original "build takes 49 s" impossible to act on.
+        $sync = Measure-CliPhase -Step 'build-stage-source' -Body {
+            Sync-SourceToStage -WinRoot $script:SourceWinPath
+        }
         $script:FlakeUri = $sync.FlakeRef
         $script:StageMarker = $sync.Marker
 
@@ -738,7 +822,7 @@ function Invoke-Build {
         }
     }
 
-    $storePath = Get-StorePath
+    $storePath = Measure-CliPhase -Step 'build-nix' -Body { Get-StorePath }
     $winPath = ConvertTo-WinPath $storePath
     Write-Host "nix-win: built $storePath" -ForegroundColor Green
     Write-Host "  Windows path: $winPath" -ForegroundColor DarkGray
@@ -771,11 +855,15 @@ function Invoke-HomeApply {
     )
 
     Write-Host "`nnix-win: deploying home files..." -ForegroundColor Cyan
-    $newFiles = Deploy-Files -WinStorePath $HomeWinPath -PrevFiles $PrevFiles -Roots @("home") `
-        -BackupDir $BackupDir -SourceUnchanged:$SourceUnchanged
+    $newFiles = Measure-CliPhase -Step 'deploy-home-files' -Body {
+        Deploy-Files -WinStorePath $HomeWinPath -PrevFiles $PrevFiles -Roots @("home") `
+            -BackupDir $BackupDir -SourceUnchanged:$SourceUnchanged
+    }
 
     Write-Host "`nnix-win: deploying home links..." -ForegroundColor Cyan
-    $newLinks = Deploy-Links -WinStorePath $HomeWinPath -PrevLinks $PrevLinks
+    $newLinks = Measure-CliPhase -Step 'deploy-home-links' -Body {
+        Deploy-Links -WinStorePath $HomeWinPath -PrevLinks $PrevLinks
+    }
 
     Write-Host "`nnix-win: running home activation..." -ForegroundColor Cyan
     $env:NIX_WIN_HOME_STORE_PATH = $HomeWinPath
@@ -839,7 +927,7 @@ function Invoke-Switch {
         throw "nix-win: 'switch' (system scope) requires an elevated shell. Use 'nix-win switch -Home' for the no-admin per-user scope."
     }
 
-    $build = Invoke-Build
+    $build = Measure-CliPhase -Step 'build' -Body { Invoke-Build }
     $state = Get-State
     $prevFiles = if ($state.files) { $state.files } else { @{} }
     $prevLinks = if ($state.ContainsKey('links') -and $state.links) { $state.links } else { @{} }
@@ -850,12 +938,16 @@ function Invoke-Switch {
         -ManifestPath (Join-Path $build.WinPath "manifest.json")
 
     Write-Host "`nnix-win: deploying files..." -ForegroundColor Cyan
-    $newFiles = Deploy-Files -WinStorePath $build.WinPath -PrevFiles $prevFiles `
-        -BackupDir (Join-Path $genDir "backups") `
-        -SourceUnchanged:($state.storePath -eq $build.StorePath -and $prevFiles.Count -gt 0)
+    $newFiles = Measure-CliPhase -Step 'deploy-files' -Generation $build.StorePath -Body {
+        Deploy-Files -WinStorePath $build.WinPath -PrevFiles $prevFiles `
+            -BackupDir (Join-Path $genDir "backups") `
+            -SourceUnchanged:($state.storePath -eq $build.StorePath -and $prevFiles.Count -gt 0)
+    }
 
     Write-Host "`nnix-win: deploying links..." -ForegroundColor Cyan
-    $newLinks = Deploy-Links -WinStorePath $build.WinPath -PrevLinks $prevLinks
+    $newLinks = Measure-CliPhase -Step 'deploy-links' -Generation $build.StorePath -Body {
+        Deploy-Links -WinStorePath $build.WinPath -PrevLinks $prevLinks
+    }
 
     Write-Host "`nnix-win: running activation scripts..." -ForegroundColor Cyan
     $env:NIX_WIN_STORE_PATH = $build.WinPath
