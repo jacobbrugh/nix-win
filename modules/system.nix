@@ -141,10 +141,10 @@ in
         description = "Generated scoopfile.json derivation.";
       };
 
-      wingetScript = lib.mkOption {
+      wingetPackages = lib.mkOption {
         type = lib.types.nullOr lib.types.package;
         default = null;
-        description = "Generated WinGet install script.";
+        description = "Generated WinGet package declaration (JSON).";
       };
 
       dscConfig = lib.mkOption {
@@ -223,9 +223,9 @@ in
     ''}
 
     # WinGet
-    ${lib.optionalString (cfg.build.wingetScript != null) ''
+    ${lib.optionalString (cfg.build.wingetPackages != null) ''
       mkdir -p $out/winget
-      cp ${cfg.build.wingetScript} $out/winget/install.ps1
+      cp ${cfg.build.wingetPackages} $out/winget/packages.json
     ''}
 
     # DSC
