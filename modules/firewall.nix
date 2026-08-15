@@ -199,6 +199,32 @@ in
             return ($x -eq $y)
         }
 
+        # Windows rewrites a CIDR remote address into address/netmask form when
+        # it stores the rule: declaring 100.64.0.0/10 reads back as
+        # 100.64.0.0/255.192.0.0. Comparing the literal strings therefore never
+        # matches, and the rule gets deleted and recreated on EVERY switch —
+        # the same "changed forever" trap the scheduled-task comparison avoids.
+        # Normalise both sides to address/prefix-length before comparing.
+        function ConvertTo-NixWinAddrKey {
+            param([string]$Address)
+            $a = "$Address".Trim()
+            if ($a -match '^([0-9.]+)/([0-9.]+)$') {
+                $addr = $Matches[1]
+                $mask = $Matches[2]
+                if ($mask -match '^\d+$') { return "$addr/$mask" }
+                # Dotted netmask -> prefix length: count the set bits.
+                try {
+                    $bytes = ([System.Net.IPAddress]::Parse($mask)).GetAddressBytes()
+                    $bits = 0
+                    foreach ($b in $bytes) {
+                        for ($i = 7; $i -ge 0; $i--) { if ($b -band (1 -shl $i)) { $bits++ } }
+                    }
+                    return "$addr/$bits"
+                } catch { return $a }
+            }
+            return $a
+        }
+
         foreach ($d in $fwDeclared) {
             # $fwName, NOT $name: these scriptblocks run inside
             # Invoke-NixWinItem, whose own [string]$Name parameter would
@@ -250,7 +276,8 @@ in
                         throw "cannot read address filters ($($fwLoadErrors['address']))"
                     }
                     if (-not $fwAddr.ContainsKey($fwName)) { return $false }
-                    $haveAddr = @($fwAddr[$fwName].RemoteAddress | ForEach-Object { "$_" })
+                    $haveAddr = @($fwAddr[$fwName].RemoteAddress | ForEach-Object { ConvertTo-NixWinAddrKey $_ })
+                    $wantAddr = @($wantAddr | ForEach-Object { ConvertTo-NixWinAddrKey $_ })
                     if (-not (Test-NixWinSetEqual -A $wantAddr -B $haveAddr)) { return $false }
                 }
                 return $true
