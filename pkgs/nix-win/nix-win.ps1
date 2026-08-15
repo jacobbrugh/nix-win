@@ -79,14 +79,23 @@ function ConvertTo-WslFlakeRef {
 # Windows drive (C:\...) or UNC (\\wsl$\...) path is translated to its WSL
 # location; a flakeref (path:/…, github:…, git+…) or bare /unix path is used
 # verbatim.
+#
+# $script:SourceWinPath records the *Windows-side* source root when the flake
+# lives on a drive path, so the build can avoid handing it to the Nix daemon
+# across the 9p bridge — see the staging block below. A \\wsl$ UNC path is
+# already inside the distro (ext4), and a bare flakeref names something Nix
+# fetches itself, so neither is staged.
+$script:SourceWinPath = $null
 if (-not $FlakeUri) {
     $cwdFlake = Join-Path (Get-Location).Path "flake.nix"
     if (-not (Test-Path $cwdFlake)) {
         throw "No flake.nix found in $((Get-Location).Path). Pass -FlakeUri <Windows path, WSL path, or flakeref> or cd into a directory containing a flake.nix."
     }
+    if ((Get-Location).Path -match '^[A-Za-z]:[\\/]') { $script:SourceWinPath = (Get-Location).Path }
     $FlakeUri = ConvertTo-WslFlakeRef (Get-Location).Path
 }
 elseif ($FlakeUri -match '^[A-Za-z]:[\\/]' -or $FlakeUri -match '^\\\\') {
+    if ($FlakeUri -match '^[A-Za-z]:[\\/]') { $script:SourceWinPath = $FlakeUri }
     $FlakeUri = ConvertTo-WslFlakeRef $FlakeUri
 }
 
@@ -552,12 +561,118 @@ function Write-GenerationRecord {
 
 # ── Commands ───────────────────────────────────────────────────────────────
 
+# ── Source staging: never let the Nix daemon read the tree over 9p ────────
+#
+# Handing `nix build` a `path:/mnt/<drive>/...` flakeref makes the daemon copy
+# the whole source into the store across the WSL 9p bridge, and that copy is
+# the single most expensive thing in a switch: measured on pc1, `nix store
+# add-path` takes ~56 s from /mnt/c against ~0.8 s for the identical tree on
+# ext4. Evaluation itself is ~0.5 s, so essentially the entire "build" is that
+# copy — and it is paid in full even when the result is a byte-identical store
+# path.
+#
+# So the source is fingerprinted on the Windows side, where NTFS reads are
+# cheap (~0.7 s for a 2,700-file tree), and:
+#   * unchanged fingerprint + the recorded store path still present -> the
+#     build is skipped outright;
+#   * otherwise the tree is mirrored into an ext4 staging directory with
+#     rsync --delete and built from there.
+#
+# The fingerprint is over file *content*, not size+mtime, so there is no
+# mtime-granularity or same-size-same-tick case to reason about; it is
+# content-addressed the same way Nix itself is. Paths are folded in too, so
+# renames and deletions register. `nix --version` is folded in because a Nix
+# upgrade can change the derivation for identical input.
+#
+# .git and .direnv are excluded. A `path:` flake exposes no git metadata (there
+# is no self.rev), so .git cannot affect the result, and it is by far the
+# largest part of the tree — 5,502 of the 8,240 files Nix would otherwise copy.
+$script:StageExcludes = @('.git', '.direnv')
+$script:StageMarker = $null
+
+# Mirror the Windows source into an ext4 staging directory. rsync is the whole
+# mechanism here, deliberately: it is exact by construction across the cases a
+# hand-rolled comparison gets wrong. This tree carries 46 reparse points —
+# `AGENTS.md` -> `CLAUDE.md`, plus `result` and `.pre-commit-config.yaml`
+# pointing into /nix/store, which Windows surfaces as reparse points whose
+# LinkTarget it cannot read. rsync reproduces all of them as symlinks, handles
+# deletions via --delete, and reports whether anything moved via --itemize-changes
+# (`-i`): empty stdout means the mirror was already identical.
+#
+# Returns @{ FlakeRef; Changed; Marker }.
+function Sync-SourceToStage {
+    param([Parameter(Mandatory)][string]$WinRoot)
+
+    $wslSrc = (wsl.exe -d $WslDistro -- wslpath -a ($WinRoot.Replace('\', '/')) 2>$null).Trim()
+    if (-not $wslSrc) { throw "Could not translate source path to a WSL path: $WinRoot" }
+
+    # One stage per source root, keyed by a digest of the path so two checkouts
+    # never collide. The marker lives *beside* the stage, not inside it, because
+    # --delete would otherwise remove it as extraneous.
+    $key = [Convert]::ToHexString(
+        [System.Security.Cryptography.SHA256]::HashData(
+            [Text.Encoding]::UTF8.GetBytes($wslSrc))).Substring(0, 16).ToLower()
+    $base = (Invoke-Wsl "printf %s `"`$HOME/.cache/nix-win/stage`"") -join ''
+    $stage = "$base/$key"
+    $marker = "$base/$key.built"
+
+    $excl = ($script:StageExcludes | ForEach-Object { "--exclude '$_'" }) -join ' '
+    $out = Invoke-Wsl "mkdir -p '$stage' && rsync -ai --delete $excl '$wslSrc/' '$stage/'"
+    $changed = @($out | Where-Object { "$_".Trim() }).Count -gt 0
+
+    return @{ FlakeRef = "path:$stage"; Changed = $changed; Marker = $marker }
+}
+
 function Invoke-Build {
+    if ($script:SourceWinPath) {
+        Write-Host "nix-win: staging source on ext4..." -ForegroundColor Cyan
+        $sync = Sync-SourceToStage -WinRoot $script:SourceWinPath
+        $script:FlakeUri = $sync.FlakeRef
+        $script:StageMarker = $sync.Marker
+
+        # Fast path: nothing in the source moved, and the store path recorded by
+        # the last *successful* switch was built from this same staged tree and
+        # is still present. Then there is nothing to build. This is what turns a
+        # converged switch's ~49 s build phase into ~3.4 s.
+        #
+        # The marker is what makes this safe against a failed switch: it is
+        # written only after activation succeeds, so a run that synced new
+        # sources and then died leaves marker != state.storePath and the next
+        # run rebuilds instead of wrongly reusing the older path.
+        if (-not $sync.Changed) {
+            $prev = Get-State
+            $PSNativeCommandUseErrorActionPreference = $false
+            $built = wsl.exe -d $WslDistro -u $WslUser -- bash -c "cat '$($sync.Marker)' 2>/dev/null" 2>$null
+            $built = ($built | Select-Object -First 1)
+            if ($built) { $built = "$built".Trim() }
+            if ($built -and $prev.storePath -and $built -eq $prev.storePath) {
+                wsl.exe -d $WslDistro -u $WslUser -- test -e "$($prev.storePath)" 2>&1 | Out-Null
+                if ($LASTEXITCODE -eq 0) {
+                    $winPath = ConvertTo-WinPath $prev.storePath
+                    Write-Host "nix-win: source unchanged, reusing $($prev.storePath)" -ForegroundColor Green
+                    Write-Host "  Windows path: $winPath" -ForegroundColor DarkGray
+                    return @{ StorePath = $prev.storePath; WinPath = $winPath }
+                }
+                # A garbage collection between switches can remove the path;
+                # fall through to a normal build rather than failing.
+                Write-Host "nix-win: recorded store path is gone; rebuilding." -ForegroundColor Yellow
+            }
+        }
+    }
+
     $storePath = Get-StorePath
     $winPath = ConvertTo-WinPath $storePath
     Write-Host "nix-win: built $storePath" -ForegroundColor Green
     Write-Host "  Windows path: $winPath" -ForegroundColor DarkGray
     return @{ StorePath = $storePath; WinPath = $winPath }
+}
+
+# Record which store path the current staged tree produced, so the next switch
+# can skip the build. Called only after a switch has fully succeeded.
+function Set-StageMarker {
+    param([Parameter(Mandatory)][string]$StorePath)
+    if (-not $script:StageMarker) { return }
+    Invoke-Wsl "printf %s '$StorePath' > '$script:StageMarker'" | Out-Null
 }
 
 # Apply a winHome activation package (the per-user toplevel): deploy the
@@ -710,6 +825,10 @@ function Invoke-Switch {
         links             = $newLinks
     }
     Save-State $newState
+
+    # Only now is it true that this staged tree produced a fully applied
+    # generation, so only now may the next switch skip its build.
+    Set-StageMarker -StorePath $build.StorePath
 
     # Embedded per-user scope: apply the current user's home activation
     # package if the toplevel carries one (home-manager integration). Runs
