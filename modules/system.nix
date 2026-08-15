@@ -153,6 +153,18 @@ in
         description = "Generated scheduled-task declaration (JSON).";
       };
 
+      services = lib.mkOption {
+        type = lib.types.nullOr lib.types.package;
+        default = null;
+        description = "Generated Windows service declaration (JSON).";
+      };
+
+      firewallRules = lib.mkOption {
+        type = lib.types.nullOr lib.types.package;
+        default = null;
+        description = "Generated firewall rule declaration (JSON).";
+      };
+
       dscConfig = lib.mkOption {
         type = lib.types.nullOr lib.types.package;
         default = null;
@@ -238,6 +250,18 @@ in
     ${lib.optionalString (cfg.build.scheduledTasks != null) ''
       mkdir -p $out/scheduled-tasks
       cp ${cfg.build.scheduledTasks} $out/scheduled-tasks/tasks.json
+    ''}
+
+    # Services
+    ${lib.optionalString (cfg.build.services != null) ''
+      mkdir -p $out/services
+      cp ${cfg.build.services} $out/services/services.json
+    ''}
+
+    # Firewall
+    ${lib.optionalString (cfg.build.firewallRules != null) ''
+      mkdir -p $out/firewall
+      cp ${cfg.build.firewallRules} $out/firewall/rules.json
     ''}
 
     # DSC
