@@ -484,6 +484,10 @@ function Deploy-Files {
     )
 
     $newFiles = @{}
+    # Target paths this pass actually wrote. Published to activation via
+    # NIX_WIN_CHANGED_FILES so a step can restart a daemon only when the
+    # config it reads genuinely moved — see Publish-ChangedFiles.
+    $script:LastDeployChanged = [System.Collections.Generic.List[string]]::new()
 
     # Enumerate incoming deployments up front: feeds both the stale sweep
     # and the deploy pass. $WinStorePath is a \\wsl$ UNC path, so this walks
@@ -570,6 +574,7 @@ function Deploy-Files {
 
         Copy-FileRobust -Source $entry.Source -Destination $targetPath
         $newFiles[$fileKey] = @{ status = "managed" }
+        $script:LastDeployChanged.Add($targetPath)
         Write-Host "  $($entry.RelativePath) -> $targetPath" -ForegroundColor DarkGray
     }
 
@@ -580,6 +585,38 @@ function Deploy-Files {
     }
 
     return $newFiles
+}
+
+# Publish the set of files the last Deploy-Files pass actually wrote, so
+# activation steps can act only on real change. Without this, a step that
+# restarts a daemon to pick up its config restarts it on EVERY switch —
+# AutoHotkey was killed and relaunched every time, dropping every hotkey
+# mid-switch, even when the deployed .ahk was byte-identical.
+#
+# A path, not the contents, because the list can be long and activation runs
+# in a separate process.
+function Publish-ChangedFiles {
+    param([Parameter(Mandatory)][string]$Scope)
+    if (-not (Test-Path -LiteralPath $StateDir)) {
+        New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
+    }
+    $path = Join-Path $StateDir "changed-files.$Scope.json"
+    $list = @()
+    if ($null -ne $script:LastDeployChanged) { $list = @($script:LastDeployChanged) }
+    # The empty case is written literally. Piping an empty array into
+    # ConvertTo-Json sends ZERO objects down the pipeline, so it returns $null
+    # and Set-Content produces a 0-byte file — and "nothing changed" is
+    # precisely the converged switch this whole mechanism exists to make
+    # cheap, so that path must not be the fragile one. (Passing @() as
+    # -InputObject with -AsArray is no better: it wraps the empty array,
+    # yielding [[]].)
+    #
+    # -AsArray otherwise matters because ConvertTo-Json unwraps a 1-element
+    # array to a bare scalar, which would make a single changed file parse
+    # back as a string rather than a list.
+    $json = if ($list.Count -eq 0) { '[]' } else { [string[]]$list | ConvertTo-Json -AsArray -Compress }
+    Set-Content -LiteralPath $path -Value $json -NoNewline
+    $env:NIX_WIN_CHANGED_FILES = $path
 }
 
 # Record a generation on disk: the generation directory plus
@@ -742,6 +779,7 @@ function Invoke-HomeApply {
 
     Write-Host "`nnix-win: running home activation..." -ForegroundColor Cyan
     $env:NIX_WIN_HOME_STORE_PATH = $HomeWinPath
+    Publish-ChangedFiles -Scope "home"
     $activateScript = Join-Path $HomeWinPath "activate.ps1"
     if (Test-Path $activateScript) {
         # Out-Host, not a bare call: this function RETURNS a hashtable that
@@ -825,6 +863,7 @@ function Invoke-Switch {
     # output that belongs on disk rather than in the console log — see the
     # dsc module, which parks its full result JSON here).
     $env:NIX_WIN_GENERATION_DIR = $genDir
+    Publish-ChangedFiles -Scope "system"
     $activateScript = Join-Path $build.WinPath "activate.ps1"
     if (Test-Path $activateScript) {
         # Wrap the activation call so a throw doesn't silently skip Save-State

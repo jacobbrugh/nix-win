@@ -53,6 +53,55 @@ in
       $ErrorActionPreference = 'Stop'
       Set-StrictMode -Version Latest
 
+      # Did this switch actually rewrite one of the given files? The CLI
+      # publishes the set of target paths its deploy pass wrote (see
+      # Publish-ChangedFiles) so a step can restart a daemon only when the
+      # config it reads genuinely moved, instead of on every switch.
+      #
+      # Returns $true when the answer is unknown — no published list, or an
+      # unreadable one — so an older CLI, or a scope that never deployed,
+      # keeps the previous always-act behaviour rather than silently never
+      # reloading anything.
+      $script:NixWinChangedFiles = $null
+      function Test-NixWinFileChanged {
+          param([Parameter(Mandatory)][string[]]$Path)
+          if ($null -eq $script:NixWinChangedFiles) {
+              if (-not $env:NIX_WIN_CHANGED_FILES -or
+                  -not (Test-Path -LiteralPath $env:NIX_WIN_CHANGED_FILES)) {
+                  return $true
+              }
+              try {
+                  $raw = Get-Content -LiteralPath $env:NIX_WIN_CHANGED_FILES -Raw
+                  # "nothing changed" is the common case and must not be the
+                  # fragile one, so build the empty set up front and only
+                  # replace it when there is genuinely something to parse.
+                  #
+                  # Written as statements rather than `$x = if (…) { @() } …`:
+                  # an empty array in a value position enumerates to ZERO
+                  # pipeline objects, so that assignment yields $null, the
+                  # HashSet constructor throws on a null collection, and the
+                  # catch below reports "assuming everything changed" — turning
+                  # a converged switch into a full reload of everything. The
+                  # same unrolling is why $parsed is null-checked instead of
+                  # being trusted to be an array.
+                  $entries = [string[]]@()
+                  if (-not [string]::IsNullOrWhiteSpace($raw)) {
+                      $parsed = @($raw | ConvertFrom-Json)
+                      if ($null -ne $parsed) { $entries = [string[]]$parsed }
+                  }
+                  $script:NixWinChangedFiles = [System.Collections.Generic.HashSet[string]]::new(
+                      $entries, [System.StringComparer]::OrdinalIgnoreCase)
+              } catch {
+                  Write-Warning "nix-win: could not read the changed-file list ($($_.Exception.Message)); assuming everything changed."
+                  return $true
+              }
+          }
+          foreach ($p in $Path) {
+              if ($script:NixWinChangedFiles.Contains($p)) { return $true }
+          }
+          return $false
+      }
+
       # Broadcast WM_SETTINGCHANGE so running Explorer / shell sessions
       # refresh their environment after HKCU\Environment edits.
       $script:NixWinEnvType = $null
