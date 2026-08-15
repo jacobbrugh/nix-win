@@ -139,6 +139,13 @@ let
             $gen = ""
             if ($env:NIX_WIN_STORE_PATH) { $gen = $env:NIX_WIN_STORE_PATH }
             elseif ($env:NIX_WIN_HOME_STORE_PATH) { $gen = $env:NIX_WIN_HOME_STORE_PATH }
+            # Those env vars hold the \\wsl$\<distro>\nix\store\... UNC form.
+            # Normalise back to /nix/store/... so a Windows generation is
+            # directly comparable to the Unix side's, which records the store
+            # path read from /run/current-system.
+            if ($gen -match '^\\\\wsl\$\\[^\\]+\\(.*)$') {
+                $gen = '/' + ($Matches[1] -replace '\\', '/')
+            }
 
             $now = [DateTimeOffset]::UtcNow
             # Unix epoch nanoseconds. DateTimeOffset only resolves to 100ns
