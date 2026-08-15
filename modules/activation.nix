@@ -90,7 +90,16 @@ in
               [Parameter(Mandatory)][scriptblock]$Set
           )
           try {
-              if (& $Test) {
+              # A test body that writes anything to the success stream returns
+              # an ARRAY, and a non-empty array is always truthy — so a stray
+              # `Write-Output` or an unassigned expression would silently make
+              # every item report converged. Take the last emitted value, which
+              # is the answer by the same convention DSC's TestScript uses.
+              $verdict = & $Test
+              if ($verdict -is [System.Array]) {
+                  $verdict = if ($verdict.Length -gt 0) { $verdict[-1] } else { $false }
+              }
+              if ($verdict) {
                   Write-Host "  $Name ok" -ForegroundColor DarkGray
                   return
               }
