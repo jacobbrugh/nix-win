@@ -29,6 +29,129 @@ let
   dscYaml = pkgs.runCommand "dsc-config.yaml" { nativeBuildInputs = [ pkgs.yq-go ]; } ''
     yq -P < ${dscJson} > $out
   '';
+
+  # Which manifests this configuration actually needs. Everything else in the
+  # dsc install directory is discovery cost we pay for nothing.
+  resourceTypes = lib.unique (map (r: r.type or "") allResources);
+  needsRegistry = lib.elem "Microsoft.Windows/Registry" resourceTypes;
+  needsAdapter = lib.elem "Microsoft.Windows/WindowsPowerShell" resourceTypes;
+
+  # Only curate when every declared type is one we know how to stage.
+  # DSC_RESOURCE_PATH REPLACES the search path rather than adding to it, so a
+  # type we did not anticipate (an extraResources entry naming some other
+  # resource) would simply stop being discoverable. Falling back to default
+  # discovery is slower but always correct, which is the right trade for a
+  # tool that applies system configuration.
+  stageableTypes = [
+    "Microsoft.Windows/Registry"
+    "Microsoft.Windows/WindowsPowerShell"
+  ];
+  unstageable = lib.subtractLists stageableTypes resourceTypes;
+  curateDiscovery = allResources != [ ] && unstageable == [ ];
+
+  curationBlock = lib.optionalString curateDiscovery ''
+    # ── Curated resource discovery ────────────────────────────────────
+    # dsc re-runs discovery on every invocation, scanning its whole install
+    # directory plus every directory on PATH. Almost all of that is for
+    # resources this configuration never uses: an appx discovery extension
+    # that shells out to Get-AppxPackage (~1.2 s), the WMI adapter
+    # enumerating 918 read-only resources (~0.69 s), and the pwsh-7
+    # adapter's own List (~0.49 s). Measured on this host at 1.77-1.85 s
+    # per invocation, entirely wasted.
+    #
+    # DSC_RESOURCE_PATH replaces that search path, so staging just the
+    # manifests we use cuts discovery to 0.16-0.23 s.
+    #
+    # CAREFUL: it replaces the EXECUTABLE lookup path too, not only the
+    # manifest search path. Staging the adapter manifest without a
+    # directory containing powershell.exe produces
+    #     WARN Executable 'powershell' not found for operation 'get' ...
+    # and every adapted resource then fails. `dsc resource list` does NOT
+    # reveal this — listing only reads manifests and never resolves their
+    # executables, so it looks perfectly healthy. It takes an actual
+    # adapted-resource invocation to surface it. Hence the explicit
+    # WindowsPowerShell\v1.0 entry below.
+    $prevResourcePath = $env:DSC_RESOURCE_PATH
+    $dscStaged = $true
+    # .Source is empty when dsc resolves to something that is not a file on
+    # disk (a function or alias). Curation needs the install directory, so
+    # fall back to default discovery rather than failing the switch.
+    $dscReal = (Get-Command dsc).Source
+    if ([string]::IsNullOrEmpty($dscReal)) {
+        Write-Warning "nix-win: cannot locate the dsc executable on disk; falling back to default discovery."
+        $dscStaged = $false
+    }
+    $dscPkg = $null
+    $dscStage = Join-Path $env:LOCALAPPDATA "nix-win\dsc-resources"
+    if ($dscStaged) {
+        # WinGet installs dsc.exe as a shim symlink under ...\WinGet\Links;
+        # the manifests live beside the real binary, not beside the shim.
+        try {
+            $dscLink = (Get-Item -LiteralPath $dscReal).LinkTarget
+            if ($dscLink) { $dscReal = $dscLink }
+        } catch { }
+        $dscPkg = Split-Path -Parent $dscReal
+    }
+
+    $dscWanted = @(${
+      lib.concatStringsSep ", " (
+        (lib.optionals needsRegistry [
+          "'registry.dsc.resource.json'"
+          "'registry.exe'"
+        ])
+        ++ (lib.optionals needsAdapter [ "'windowspowershell.dsc.resource.json'" ])
+      )
+    })
+    if ($dscStaged -and -not (Test-Path -LiteralPath $dscStage)) {
+        New-Item -ItemType Directory -Path $dscStage -Force | Out-Null
+    }
+    foreach ($f in $(if ($dscStaged) { $dscWanted } else { @() })) {
+        $src = Join-Path $dscPkg $f
+        $dst = Join-Path $dscStage $f
+        if (-not (Test-Path -LiteralPath $src)) {
+            Write-Warning "nix-win: $f is missing from the dsc install at $dscPkg; falling back to default discovery."
+            $dscStaged = $false
+            break
+        }
+        # Copy only when it differs, so a repeat switch does no IO.
+        if (-not (Test-Path -LiteralPath $dst) -or
+            (Get-Item -LiteralPath $dst).Length -ne (Get-Item -LiteralPath $src).Length) {
+            Copy-Item -LiteralPath $src -Destination $dst -Force
+        }
+    }
+    ${lib.optionalString needsAdapter ''
+      # The adapter manifest invokes ./psDscAdapter/powershell.resource.ps1
+      # relative to its own directory, so that directory has to come along.
+      if ($dscStaged) {
+          $adapterSrc = Join-Path $dscPkg "psDscAdapter"
+          $adapterDst = Join-Path $dscStage "psDscAdapter"
+          if (-not (Test-Path -LiteralPath $adapterSrc)) {
+              Write-Warning "nix-win: psDscAdapter is missing from the dsc install; falling back to default discovery."
+              $dscStaged = $false
+          } elseif (-not (Test-Path -LiteralPath $adapterDst)) {
+              Copy-Item -LiteralPath $adapterSrc -Destination $adapterDst -Recurse -Force
+          }
+      }
+    ''}
+
+    if ($dscStaged) {
+        $dscPathEntries = @($dscStage)
+        ${lib.optionalString needsAdapter ''
+          # Where powershell.exe lives — the adapter's declared executable.
+          $ps51 = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0"
+          if (Test-Path -LiteralPath $ps51) { $dscPathEntries += $ps51 }
+        ''}
+        $env:DSC_RESOURCE_PATH = $dscPathEntries -join ';'
+    }
+  '';
+
+  restoreBlock = lib.optionalString curateDiscovery ''
+    if ($null -eq $prevResourcePath) {
+        Remove-Item Env:DSC_RESOURCE_PATH -ErrorAction SilentlyContinue
+    } else {
+        $env:DSC_RESOURCE_PATH = $prevResourcePath
+    }
+  '';
 in
 {
   imports = [
@@ -69,6 +192,7 @@ in
         Write-Host "nix-win: applying DSC configuration..." -ForegroundColor Cyan
         $dscConfig = Join-Path $env:NIX_WIN_STORE_PATH "dsc\config.yaml"
         if (Get-Command dsc -ErrorAction SilentlyContinue) {
+${curationBlock}
             # Strip PowerToys DSCModules from PATH during DSC run — DSC v3 can't
             # resolve the relative PowerToys.DSC.exe path in their manifests, causing
             # ~125 spurious warnings. We don't use any PowerToys DSC resources.
@@ -90,6 +214,7 @@ in
             $dscOut = "" | dsc config set --file $dscConfig
             $dscExit = $LASTEXITCODE
             $env:PATH = $prevPath
+${restoreBlock}
 
             # Park the full document next to the generation record. It carries
             # per-resource durations, which is the only reliable way to attribute
