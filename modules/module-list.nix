@@ -9,6 +9,7 @@
   ./environment-files.nix
   ./system-packages.nix
   ./activation.nix
+  ./converge-scripts.nix
   ./scoop.nix
   ./scheduled-tasks.nix
   ./winget.nix
