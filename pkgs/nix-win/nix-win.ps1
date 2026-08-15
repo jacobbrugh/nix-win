@@ -821,6 +821,10 @@ function Invoke-Switch {
 
     Write-Host "`nnix-win: running activation scripts..." -ForegroundColor Cyan
     $env:NIX_WIN_STORE_PATH = $build.WinPath
+    # Where activation steps may drop per-generation artifacts (large tool
+    # output that belongs on disk rather than in the console log — see the
+    # dsc module, which parks its full result JSON here).
+    $env:NIX_WIN_GENERATION_DIR = $genDir
     $activateScript = Join-Path $build.WinPath "activate.ps1"
     if (Test-Path $activateScript) {
         # Wrap the activation call so a throw doesn't silently skip Save-State
