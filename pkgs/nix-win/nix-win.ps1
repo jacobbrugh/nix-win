@@ -823,8 +823,13 @@ function Sync-SourceToStage {
     $markerKey = if ($script:OverrideKey) { "$key.$($script:OverrideKey)" } else { $key }
     $marker = "$base/$markerKey.built"
 
+    # --delete-excluded, not just --delete: with plain --delete, rsync PROTECTS
+    # files on the receiving side that match an --exclude, so anything already
+    # in the stage from before a pattern was added survives forever. Adding
+    # __pycache__ to the exclude list therefore changed nothing on its own —
+    # the stale bytecode stayed in the stage and kept reaching the build.
     $excl = ($script:StageExcludes | ForEach-Object { "--exclude '$_'" }) -join ' '
-    $out = Invoke-Wsl "mkdir -p '$stage' && rsync -ai --delete $excl '$wslSrc/' '$stage/'"
+    $out = Invoke-Wsl "mkdir -p '$stage' && rsync -ai --delete --delete-excluded $excl '$wslSrc/' '$stage/'"
     $changed = @($out | Where-Object { "$_".Trim() }).Count -gt 0
 
     return @{ FlakeRef = "path:$stage"; Changed = $changed; Marker = $marker }
