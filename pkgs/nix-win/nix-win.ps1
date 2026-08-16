@@ -782,7 +782,14 @@ function Write-GenerationRecord {
 # .git and .direnv are excluded. A `path:` flake exposes no git metadata (there
 # is no self.rev), so .git cannot affect the result, and it is by far the
 # largest part of the tree — 5,502 of the 8,240 files Nix would otherwise copy.
-$script:StageExcludes = @('.git', '.direnv')
+# `__pycache__` is excluded for correctness, not tidiness. The stage is not a
+# git repo (`.git` is excluded), so a `path:` flake over it includes UNTRACKED
+# files — which a git-based build, i.e. CI, would never see. Python bytecode
+# caches sitting in the working tree therefore ended up inside the built
+# closure, and since CPython rewrites a .pyc whenever it reimports the module,
+# those 18 files drifted and were re-copied on EVERY switch. Excluding them
+# both removes that churn and makes the staged build match what CI builds.
+$script:StageExcludes = @('.git', '.direnv', '__pycache__')
 $script:StageMarker = $null
 
 # Mirror the Windows source into an ext4 staging directory. rsync is the whole
