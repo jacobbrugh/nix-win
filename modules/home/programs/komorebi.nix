@@ -184,10 +184,15 @@ in
                 if cfg.relaunchTask != null then
                   ''
                     Write-Host "nix-win: restarting Komorebi..." -ForegroundColor Cyan
-                    # Keep komorebic's output instead of discarding it; a stop
-                    # that fails is worth seeing before we start the task again.
+                    # Keep komorebic's output instead of discarding it, but gate
+                    # on the exit code rather than on the text being non-empty:
+                    # `komorebic stop --bar` writes a bare "Error:" header to
+                    # stderr and still exits 0, so the non-empty test reported a
+                    # scary failure on every single restart.
                     $komoOut = (komorebic stop --bar 2>&1 | Out-String).Trim()
-                    if ($komoOut) { Write-Host "  $komoOut" -ForegroundColor DarkGray }
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Host "  komorebic stop --bar failed (exit $LASTEXITCODE): $komoOut" -ForegroundColor Yellow
+                    }
                     Start-Sleep -Seconds 2
                     Start-ScheduledTask -TaskName "${cfg.relaunchTask}" -ErrorAction Stop
                   ''
@@ -195,7 +200,9 @@ in
                   ''
                     Write-Host "nix-win: reloading Komorebi..." -ForegroundColor Cyan
                     $komoOut = (komorebic reload-configuration 2>&1 | Out-String).Trim()
-                    if ($komoOut) { Write-Host "  $komoOut" -ForegroundColor DarkGray }
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Host "  komorebic reload-configuration failed (exit $LASTEXITCODE): $komoOut" -ForegroundColor Yellow
+                    }
                   ''
               }
             }
