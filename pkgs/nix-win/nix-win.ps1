@@ -83,6 +83,40 @@ Set-StrictMode -Version Latest
 
 $Scope = if ($HomeScope) { "home" } else { "system" }
 
+# All human-facing progress goes here, and this writes to stderr. stdout is
+# reserved for data, which is nix's own convention and what lets a caller do
+# `$p = nix-win build` and get a store path rather than a store path buried in
+# progress lines. `Write-Host` targets the information stream, which renders on
+# stdout at the process boundary, so it cannot be used for this.
+#
+# [Console]::Error.WriteLine takes no -ForegroundColor, so the colour is set
+# around the write — and skipped entirely when stderr is redirected, because
+# otherwise every captured log would gain ANSI escapes that the information
+# stream suppresses today. The parameter name matches the cmdlet it replaces so
+# call sites read identically.
+#
+# [Console]::Error is the process's real fd 2, which is what every caller that
+# spawns this CLI as a child process sees — `nix-switch` runs it as
+# `pwsh -Command "nix-win switch …"`, and both this progress and the relayed
+# build stream land on that process's stderr in order. Note the corollary: a
+# PowerShell-level `nix-win … 2>file` from an already-running pwsh does NOT
+# capture these lines, because that redirects the PowerShell error stream while
+# [Console]::Error stays bound to the original handle. Redirect the process
+# (`pwsh -File nix-win.ps1 … 2>file`) when you want them in a file.
+function Write-Status {
+    param(
+        [Parameter(Position = 0)][string]$Message = "",
+        [System.ConsoleColor]$ForegroundColor
+    )
+    $useColor = $PSBoundParameters.ContainsKey('ForegroundColor') -and -not [Console]::IsErrorRedirected
+    if ($useColor) {
+        $prev = [Console]::ForegroundColor
+        [Console]::ForegroundColor = $ForegroundColor
+    }
+    try { [Console]::Error.WriteLine($Message) }
+    finally { if ($useColor) { [Console]::ForegroundColor = $prev } }
+}
+
 # Translate a Windows path to its location inside the distro. Runs WITHOUT
 # `-u $WslUser` deliberately: wslpath is user-independent, and the default user
 # skips the login shell the configured user may carry.
@@ -223,7 +257,7 @@ function Measure-CliPhase {
 # (elevated) system switch, so it lands in the system scope.
 $legacyState = Join-Path $StateDir "state.json"
 if ((Test-Path $legacyState) -and -not (Test-Path (Join-Path $StateDir "state.system.json"))) {
-    Write-Host "nix-win: migrating v1 state to the scope-split layout..." -ForegroundColor Yellow
+    Write-Status "nix-win: migrating v1 state to the scope-split layout..." -ForegroundColor Yellow
     Move-Item $legacyState (Join-Path $StateDir "state.system.json")
     $legacyGens = Join-Path $StateDir "generations"
     $sysGens = Join-Path $legacyGens "system"
@@ -339,7 +373,7 @@ function Get-StorePath {
     if ($FlakeAttr) {
         $suffix = if ($HomeScope) { "activationPackage" } else { "config.system.build.toplevel" }
         $uri = "$FlakeUri#$FlakeAttr.$suffix"
-        Write-Host "nix-win: building $uri ..." -ForegroundColor Cyan
+        Write-Status "nix-win: building $uri ..." -ForegroundColor Cyan
         return Invoke-NixBuild -Uri $uri
     }
 
@@ -348,18 +382,18 @@ function Get-StorePath {
         # then bare "user".
         $primary = "winHomeConfigurations.`"$user@$hostname`".activationPackage"
         $fallback = "winHomeConfigurations.`"$user`".activationPackage"
-        Write-Host "nix-win: building $FlakeUri#$primary ..." -ForegroundColor Cyan
+        Write-Status "nix-win: building $FlakeUri#$primary ..." -ForegroundColor Cyan
         try {
             return Invoke-NixBuild -Uri "$FlakeUri#$primary"
         } catch {
-            Write-Host "nix-win: '$user@$hostname' not found or failed; trying '$user'..." -ForegroundColor Yellow
-            Write-Host "nix-win: building $FlakeUri#$fallback ..." -ForegroundColor Cyan
+            Write-Status "nix-win: '$user@$hostname' not found or failed; trying '$user'..." -ForegroundColor Yellow
+            Write-Status "nix-win: building $FlakeUri#$fallback ..." -ForegroundColor Cyan
             return Invoke-NixBuild -Uri "$FlakeUri#$fallback"
         }
     }
 
     $uri = "$FlakeUri#winConfigurations.$hostname.config.system.build.toplevel"
-    Write-Host "nix-win: building $uri ..." -ForegroundColor Cyan
+    Write-Status "nix-win: building $uri ..." -ForegroundColor Cyan
     return Invoke-NixBuild -Uri $uri
 }
 
@@ -426,7 +460,7 @@ function Remove-ManagedLink {
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
     if (-not $item) { return }
     if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
-        Write-Host "  unlink $Path" -ForegroundColor DarkGray
+        Write-Status "  unlink $Path" -ForegroundColor DarkGray
         # Remove-Item on a junction deletes the reparse point, not the
         # junction target. -Recurse:$false is belt and suspenders.
         Remove-Item -LiteralPath $Path -Force -Recurse:$false -ErrorAction SilentlyContinue
@@ -483,7 +517,7 @@ function New-ManagedLink {
         "symlink"  { "SymbolicLink" }
         default    { throw "Unknown linkType: $LinkType" }
     }
-    Write-Host "  link $TargetPath -> $Source ($LinkType)" -ForegroundColor DarkGray
+    Write-Status "  link $TargetPath -> $Source ($LinkType)" -ForegroundColor DarkGray
     New-Item -ItemType $nativeType -Path $TargetPath -Target $Source -Force | Out-Null
 }
 
@@ -617,7 +651,7 @@ function Copy-FileRobust {
     try {
         Remove-Item -LiteralPath $stale -Force -ErrorAction Stop
     } catch {
-        Write-Host "  (deferred: $stale still in use)" -ForegroundColor DarkYellow
+        Write-Status "  (deferred: $stale still in use)" -ForegroundColor DarkYellow
     }
 }
 
@@ -746,13 +780,13 @@ function Deploy-Files {
         Copy-FileRobust -Source $entry.Source -Destination $targetPath
         $newFiles[$fileKey] = @{ status = "managed" }
         $script:LastDeployChanged.Add($targetPath)
-        Write-Host "  $($entry.RelativePath) -> $targetPath" -ForegroundColor DarkGray
+        Write-Status "  $($entry.RelativePath) -> $targetPath" -ForegroundColor DarkGray
     }
 
     # Every file that was actually written is reported above, individually.
     # This only accounts for the ones that needed no work.
     if ($skipped -gt 0) {
-        Write-Host "  $skipped file(s) already up to date" -ForegroundColor DarkGray
+        Write-Status "  $skipped file(s) already up to date" -ForegroundColor DarkGray
     }
 
     return $newFiles
@@ -970,7 +1004,7 @@ function Resolve-InputOverride {
     $stage = "$base/$key"
 
     $excl = ($script:OverrideStageExcludes | ForEach-Object { "--exclude '$_'" }) -join ' '
-    Write-Host "  mirroring $full -> $stage" -ForegroundColor DarkGray
+    Write-Status "  mirroring $full -> $stage" -ForegroundColor DarkGray
     Invoke-Wsl "mkdir -p '$stage' && rsync -a --delete $excl '$srcWsl/' '$stage/'" | Out-Null
 
     # Warn loudly about uncommitted work: it is NOT in the build, and silently
@@ -978,7 +1012,7 @@ function Resolve-InputOverride {
     # behaviour for a debugging aid.
     $dirty = (Invoke-Wsl "git -C '$stage' status --porcelain 2>/dev/null | head -c 400") -join "`n"
     if ("$dirty".Trim()) {
-        Write-Host "  WARNING: $full has uncommitted changes; the override builds its committed HEAD, so they are NOT included." -ForegroundColor Yellow
+        Write-Status "  WARNING: $full has uncommitted changes; the override builds its committed HEAD, so they are NOT included." -ForegroundColor Yellow
     }
 
     $head = (Invoke-Wsl "git -C '$stage' rev-parse HEAD 2>/dev/null" | Select-Object -First 1)
@@ -996,7 +1030,7 @@ function Resolve-InputOverride {
         $ref = "$ref`?rev=$head"
         $shown = $head.Substring(0, [Math]::Min(12, $head.Length))
     }
-    Write-Host "  override $inputName -> $full @ $shown" -ForegroundColor DarkGray
+    Write-Status "  override $inputName -> $full @ $shown" -ForegroundColor DarkGray
     return @{ Name = $inputName; Ref = $ref; Source = $full }
 }
 
@@ -1006,7 +1040,7 @@ $script:OverrideKey = ""
 
 function Initialize-InputOverrides {
     if ($InputOverride.Count -eq 0) { return }
-    Write-Host "nix-win: resolving flake input overrides..." -ForegroundColor Cyan
+    Write-Status "nix-win: resolving flake input overrides..." -ForegroundColor Cyan
     $parts = @()
     foreach ($spec in $InputOverride) {
         $o = Resolve-InputOverride -Spec $spec
@@ -1024,7 +1058,7 @@ function Initialize-InputOverrides {
 
 function Invoke-Build {
     if ($script:SourceWinPath) {
-        Write-Host "nix-win: staging source on ext4..." -ForegroundColor Cyan
+        Write-Status "nix-win: staging source on ext4..." -ForegroundColor Cyan
         # Timed separately from the nix invocation: source staging and
         # eval/realize have completely different cost drivers (9p vs the
         # derivation graph), and reporting them as one number is what made the
@@ -1053,21 +1087,21 @@ function Invoke-Build {
                 Invoke-Wsl "test -e '$($prev.storePath)'" -NoThrow | Out-Null
                 if ($LASTEXITCODE -eq 0) {
                     $winPath = ConvertTo-WinPath $prev.storePath
-                    Write-Host "nix-win: source unchanged, reusing $($prev.storePath)" -ForegroundColor Green
-                    Write-Host "  Windows path: $winPath" -ForegroundColor DarkGray
+                    Write-Status "nix-win: source unchanged, reusing $($prev.storePath)" -ForegroundColor Green
+                    Write-Status "  Windows path: $winPath" -ForegroundColor DarkGray
                     return @{ StorePath = $prev.storePath; WinPath = $winPath }
                 }
                 # A garbage collection between switches can remove the path;
                 # fall through to a normal build rather than failing.
-                Write-Host "nix-win: recorded store path is gone; rebuilding." -ForegroundColor Yellow
+                Write-Status "nix-win: recorded store path is gone; rebuilding." -ForegroundColor Yellow
             }
         }
     }
 
     $storePath = Measure-CliPhase -Step 'build-nix' -Body { Get-StorePath }
     $winPath = ConvertTo-WinPath $storePath
-    Write-Host "nix-win: built $storePath" -ForegroundColor Green
-    Write-Host "  Windows path: $winPath" -ForegroundColor DarkGray
+    Write-Status "nix-win: built $storePath" -ForegroundColor Green
+    Write-Status "  Windows path: $winPath" -ForegroundColor DarkGray
     return @{ StorePath = $storePath; WinPath = $winPath }
 }
 
@@ -1096,18 +1130,18 @@ function Invoke-HomeApply {
         [switch]$SourceUnchanged
     )
 
-    Write-Host "`nnix-win: deploying home files..." -ForegroundColor Cyan
+    Write-Status "`nnix-win: deploying home files..." -ForegroundColor Cyan
     $newFiles = Measure-CliPhase -Step 'deploy-home-files' -Body {
         Deploy-Files -WinStorePath $HomeWinPath -PrevFiles $PrevFiles -Roots @("home") `
             -BackupDir $BackupDir -SourceUnchanged:$SourceUnchanged
     }
 
-    Write-Host "`nnix-win: deploying home links..." -ForegroundColor Cyan
+    Write-Status "`nnix-win: deploying home links..." -ForegroundColor Cyan
     $newLinks = Measure-CliPhase -Step 'deploy-home-links' -Body {
         Deploy-Links -WinStorePath $HomeWinPath -PrevLinks $PrevLinks
     }
 
-    Write-Host "`nnix-win: running home activation..." -ForegroundColor Cyan
+    Write-Status "`nnix-win: running home activation..." -ForegroundColor Cyan
     $env:NIX_WIN_HOME_STORE_PATH = $HomeWinPath
     Publish-ChangedFiles -Scope "home"
     $activateScript = Join-Path $HomeWinPath "activate.ps1"
@@ -1157,7 +1191,7 @@ function Invoke-HomeSwitch {
         links             = $result.links
     }
 
-    Write-Host "`nnix-win: home switch to generation $($script:NewGeneration) complete." -ForegroundColor Green
+    Write-Status "`nnix-win: home switch to generation $($script:NewGeneration) complete." -ForegroundColor Green
 }
 
 function Invoke-Switch {
@@ -1179,19 +1213,19 @@ function Invoke-Switch {
     Write-GenerationRecord -GenDir $genDir -StorePath $build.StorePath `
         -ManifestPath (Join-Path $build.WinPath "manifest.json")
 
-    Write-Host "`nnix-win: deploying files..." -ForegroundColor Cyan
+    Write-Status "`nnix-win: deploying files..." -ForegroundColor Cyan
     $newFiles = Measure-CliPhase -Step 'deploy-files' -Generation $build.StorePath -Body {
         Deploy-Files -WinStorePath $build.WinPath -PrevFiles $prevFiles `
             -BackupDir (Join-Path $genDir "backups") `
             -SourceUnchanged:($state.storePath -eq $build.StorePath -and $prevFiles.Count -gt 0)
     }
 
-    Write-Host "`nnix-win: deploying links..." -ForegroundColor Cyan
+    Write-Status "`nnix-win: deploying links..." -ForegroundColor Cyan
     $newLinks = Measure-CliPhase -Step 'deploy-links' -Generation $build.StorePath -Body {
         Deploy-Links -WinStorePath $build.WinPath -PrevLinks $prevLinks
     }
 
-    Write-Host "`nnix-win: running activation scripts..." -ForegroundColor Cyan
+    Write-Status "`nnix-win: running activation scripts..." -ForegroundColor Cyan
     $env:NIX_WIN_STORE_PATH = $build.WinPath
     # Where activation steps may drop per-generation artifacts (large tool
     # output that belongs on disk rather than in the console log — see the
@@ -1212,28 +1246,28 @@ function Invoke-Switch {
             & $activateScript
         } catch {
             $err = $_
-            Write-Host ""
-            Write-Host "════════════════════════════════════════════════════════════════════" -ForegroundColor Red
-            Write-Host " nix-win: ACTIVATION FAILED" -ForegroundColor Red
-            Write-Host "════════════════════════════════════════════════════════════════════" -ForegroundColor Red
-            Write-Host ""
-            Write-Host "Generation $script:NewGeneration was NOT saved." -ForegroundColor Red
-            Write-Host "Current state remains at generation $($state.currentGeneration)." -ForegroundColor Red
-            Write-Host ""
+            Write-Status ""
+            Write-Status "════════════════════════════════════════════════════════════════════" -ForegroundColor Red
+            Write-Status " nix-win: ACTIVATION FAILED" -ForegroundColor Red
+            Write-Status "════════════════════════════════════════════════════════════════════" -ForegroundColor Red
+            Write-Status ""
+            Write-Status "Generation $script:NewGeneration was NOT saved." -ForegroundColor Red
+            Write-Status "Current state remains at generation $($state.currentGeneration)." -ForegroundColor Red
+            Write-Status ""
             if ($err.InvocationInfo -and $err.InvocationInfo.PositionMessage) {
-                Write-Host "Failed at:" -ForegroundColor Red
-                Write-Host $err.InvocationInfo.PositionMessage -ForegroundColor Yellow
-                Write-Host ""
+                Write-Status "Failed at:" -ForegroundColor Red
+                Write-Status $err.InvocationInfo.PositionMessage -ForegroundColor Yellow
+                Write-Status ""
             }
-            Write-Host "Error:" -ForegroundColor Red
-            Write-Host "  $($err.Exception.Message)" -ForegroundColor Yellow
+            Write-Status "Error:" -ForegroundColor Red
+            Write-Status "  $($err.Exception.Message)" -ForegroundColor Yellow
             if ($err.ScriptStackTrace) {
-                Write-Host ""
-                Write-Host "Stack trace:" -ForegroundColor Red
-                Write-Host $err.ScriptStackTrace -ForegroundColor DarkGray
+                Write-Status ""
+                Write-Status "Stack trace:" -ForegroundColor Red
+                Write-Status $err.ScriptStackTrace -ForegroundColor DarkGray
             }
-            Write-Host ""
-            Write-Host "════════════════════════════════════════════════════════════════════" -ForegroundColor Red
+            Write-Status ""
+            Write-Status "════════════════════════════════════════════════════════════════════" -ForegroundColor Red
             # Re-throw so the overall script exits non-zero and any wrapping
             # script (CI, scheduled task) sees the failure.
             throw
@@ -1261,7 +1295,7 @@ function Invoke-Switch {
     # profiles belong to them; they run `nix-win switch -Home` themselves.
     $userDir = Join-Path $build.WinPath "users" | Join-Path -ChildPath $env:USERNAME.ToLower()
     if (Test-Path -LiteralPath $userDir) {
-        Write-Host "`nnix-win: applying embedded home scope for $env:USERNAME..." -ForegroundColor Cyan
+        Write-Status "`nnix-win: applying embedded home scope for $env:USERNAME..." -ForegroundColor Cyan
         $homeStateFile = Join-Path $StateDir "state.home.json"
         $homeState = Get-State -Path $homeStateFile
         $homePrevFiles = if ($homeState.files) { $homeState.files } else { @{} }
@@ -1292,7 +1326,7 @@ function Invoke-Switch {
         }
     }
 
-    Write-Host "`nnix-win: switch to generation $($script:NewGeneration) complete." -ForegroundColor Green
+    Write-Status "`nnix-win: switch to generation $($script:NewGeneration) complete." -ForegroundColor Green
 }
 
 function Invoke-Rollback {
@@ -1308,7 +1342,7 @@ function Invoke-Rollback {
         Write-Error "Generation $prevGen state not found at $genDir"
         return
     }
-    Write-Host "nix-win: rolling back to generation $prevGen ($Scope scope)" -ForegroundColor Yellow
+    Write-Status "nix-win: rolling back to generation $prevGen ($Scope scope)" -ForegroundColor Yellow
     $storePath = (Get-Content $storePathFile).Trim()
     $winPath = ConvertTo-WinPath $storePath
 
@@ -1336,21 +1370,23 @@ function Invoke-Rollback {
             & $activateScript
         }
     }
-    Write-Host "nix-win: rolled back to generation $prevGen." -ForegroundColor Green
+    Write-Status "nix-win: rolled back to generation $prevGen." -ForegroundColor Green
 }
 
 function Invoke-ListGenerations {
     if (-not (Test-Path $GenerationsDir)) {
-        Write-Host "No generations found." -ForegroundColor Yellow
+        Write-Status "No generations found." -ForegroundColor Yellow
         return
     }
     $state = Get-State
+    # The listing is this command's data, so it goes to stdout via the success
+    # stream — not through Write-Status, which is for progress.
     Get-ChildItem $GenerationsDir -Directory | Sort-Object { [int]$_.Name } | ForEach-Object {
         $gen = $_.Name
         $tsFile = Join-Path $_.FullName "timestamp.txt"
         $ts = if (Test-Path $tsFile) { Get-Content $tsFile } else { "unknown" }
         $current = if ($gen -eq $state.currentGeneration) { " *" } else { "" }
-        Write-Host "  Generation $gen — $ts$current"
+        Write-Output "  Generation $gen — $ts$current"
     }
 }
 
@@ -1360,10 +1396,10 @@ function Invoke-GC {
     $gens = Get-ChildItem $GenerationsDir -Directory | Sort-Object { [int]$_.Name } -Descending
     $toRemove = $gens | Select-Object -Skip $Keep | Where-Object { $_.Name -ne $state.currentGeneration }
     foreach ($gen in $toRemove) {
-        Write-Host "  Removing generation $($gen.Name)" -ForegroundColor DarkGray
+        Write-Status "  Removing generation $($gen.Name)" -ForegroundColor DarkGray
         Remove-Item $gen.FullName -Recurse -Force
     }
-    Write-Host "nix-win: kept $Keep most recent generations." -ForegroundColor Green
+    Write-Status "nix-win: kept $Keep most recent generations." -ForegroundColor Green
 }
 
 # Update one flake input's lock entry in the flake this invocation points at.
@@ -1378,7 +1414,7 @@ function Invoke-UpdateInput {
     }
     $wslPath = ConvertTo-WslPath $script:SourceWinPath -ErrorContext "Could not translate to a WSL path"
 
-    Write-Host "nix-win: updating flake input '$InputName' in $script:SourceWinPath ..." -ForegroundColor Cyan
+    Write-Status "nix-win: updating flake input '$InputName' in $script:SourceWinPath ..." -ForegroundColor Cyan
     # nix writes its progress and errors to stderr, which satisfies
     # Invoke-WslStreaming's fd-2 contract.
     #
@@ -1386,11 +1422,11 @@ function Invoke-UpdateInput {
     # `nix flake lock --update-input <input>`. Try the former, fall back.
     $rc = Invoke-WslStreaming "cd '$wslPath' && nix flake update '$InputName'"
     if ($rc -ne 0) {
-        Write-Host "nix-win: retrying with the older --update-input spelling..." -ForegroundColor Yellow
+        Write-Status "nix-win: retrying with the older --update-input spelling..." -ForegroundColor Yellow
         $rc = Invoke-WslStreaming "cd '$wslPath' && nix flake lock --update-input '$InputName'"
         if ($rc -ne 0) { throw "nix flake update failed (exit $rc)." }
     }
-    Write-Host "nix-win: '$InputName' updated. Review the flake.lock diff, then switch." -ForegroundColor Green
+    Write-Status "nix-win: '$InputName' updated. Review the flake.lock diff, then switch." -ForegroundColor Green
 }
 
 # ── Main ───────────────────────────────────────────────────────────────────
@@ -1400,7 +1436,10 @@ function Invoke-UpdateInput {
 if ($Command -in @("build", "switch")) { Initialize-InputOverrides }
 
 switch ($Command) {
-    "build" { Invoke-Build | Out-Null }
+    # The store path is this command's data: it goes to stdout, while every
+    # progress line went to stderr via Write-Status. `nix-win build > path.txt`
+    # therefore leaves just the path in the file.
+    "build" { (Invoke-Build).StorePath }
     "switch" { if ($HomeScope) { Invoke-HomeSwitch } else { Invoke-Switch } }
     "rollback" { Invoke-Rollback }
     "list-generations" { Invoke-ListGenerations }
