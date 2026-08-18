@@ -245,32 +245,53 @@ function Invoke-Wsl {
 function Invoke-NixBuild {
     param([string]$Uri)
 
-    # Run the build directly (not through Invoke-Wsl) so nix's stderr — its
-    # progress bar / build log — streams live to the host console exactly as it
-    # would on the host, instead of being buffered until the build finishes.
-    # `--print-out-paths` writes the resolved store path to stdout, which we DO
-    # capture here. Leaving stderr unredirected (no `2>&1`) is the whole point:
-    # PowerShell captures only stdout into $output and passes the native
-    # command's stderr straight through to the console as it arrives.
+    # Run the build under a pty so nix selects its progress-bar logger and
+    # renders exactly as it does on the host. `wsl.exe <command>` never
+    # allocates one: measured from a real console, across every invocation shape
+    # and with and without PowerShell capturing stdout, the Linux side always
+    # sees plain pipes — so nix fell back to its simple logger, which prints
+    # nothing whatsoever through evaluation and substitution, and a long build
+    # was indistinguishable from a hung one. `script` creates the pty inside
+    # Linux, so it does not depend on what wsl.exe hands over, and `script -e`
+    # returns the child's exit status for the $LASTEXITCODE check below.
+    #
+    # A pty merges stdout and stderr into one stream, so `--print-out-paths`
+    # cannot stay on stdout — the store path would interleave into the bar. It
+    # goes to a file inside WSL instead, which also leaves PowerShell nothing to
+    # capture, so all three std handles stay inherited down to the console.
     #
     # Disable native-exit auto-throw locally so the explicit $LASTEXITCODE check
     # below owns the failure message; pwsh 7.4+ with $ErrorActionPreference='Stop'
-    # would otherwise throw a generic "wsl.exe exited with code N" at the
-    # assignment. nix's own error has already streamed to the console above, so
-    # "See the build log above" is accurate.
-    # --override-input pairs, quoted for the bash -c that runs them.
+    # would otherwise throw a generic "wsl.exe exited with code N". nix's own
+    # error has already streamed to the console above, so "See the build log
+    # above" is accurate.
+    # --override-input pairs, quoted for the shell that runs them. These must
+    # stay ahead of the redirect below.
     $overrides = ""
     if ($script:OverrideArgs.Count -gt 0) {
         $overrides = " " + (($script:OverrideArgs | ForEach-Object { "'$_'" }) -join ' ')
     }
 
     $PSNativeCommandUseErrorActionPreference = $false
-    $output = wsl.exe -d $WslDistro -u $WslUser -- bash -c "nix build '$Uri' --no-link --print-out-paths --no-write-lock-file$overrides"
-    if ($LASTEXITCODE -ne 0) {
-        throw "nix build failed (exit $LASTEXITCODE). See the build log above."
+    $outFile = "/tmp/nix-win-outpath.$PID"
+    $cmd = "nix build '$Uri' --no-link --print-out-paths --no-write-lock-file$overrides > $outFile"
+    # `1>&2` is load-bearing. PowerShell collects a native command's stdout into
+    # the enclosing function's output, so relaying the pty on fd 1 would splice
+    # every progress-bar frame into this function's return value and the caller
+    # would receive an array of bar frames instead of a store path. Native
+    # stderr is passed straight through to the console untouched, which is
+    # exactly the behaviour the bar wants.
+    wsl.exe -d $WslDistro -u $WslUser -- bash -c "script -qec `"$cmd`" /dev/null 1>&2"
+    $buildExit = $LASTEXITCODE
+    if ($buildExit -ne 0) {
+        wsl.exe -d $WslDistro -u $WslUser -- rm -f $outFile 2>&1 | Out-Null
+        throw "nix build failed (exit $buildExit). See the build log above."
     }
 
-    $storePath = ($output | Select-Object -Last 1).Trim()
+    $output = wsl.exe -d $WslDistro -u $WslUser -- cat $outFile
+    wsl.exe -d $WslDistro -u $WslUser -- rm -f $outFile 2>&1 | Out-Null
+
+    $storePath = "$($output | Select-Object -Last 1)".Trim()
     if (-not $storePath -or -not $storePath.StartsWith("/nix/store/")) {
         throw "nix build returned invalid store path. Full output:`n$output"
     }
