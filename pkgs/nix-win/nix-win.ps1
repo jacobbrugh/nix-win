@@ -83,6 +83,22 @@ Set-StrictMode -Version Latest
 
 $Scope = if ($HomeScope) { "home" } else { "system" }
 
+# Translate a Windows path to its location inside the distro. Runs WITHOUT
+# `-u $WslUser` deliberately: wslpath is user-independent, and the default user
+# skips the login shell the configured user may carry.
+#
+# `wslpath -a` would corrupt an already-absolute /unix path into /mnt/c/unix, so
+# only genuine Windows paths may be passed here.
+function ConvertTo-WslPath {
+    param(
+        [Parameter(Mandatory)][string]$WinPath,
+        [string]$ErrorContext = "Could not translate Windows path to a WSL path"
+    )
+    $wslPath = (wsl.exe -d $WslDistro -- wslpath -a ($WinPath.Replace('\', '/')) 2>$null).Trim()
+    if (-not $wslPath) { throw "${ErrorContext}: $WinPath" }
+    return $wslPath
+}
+
 # Translate a Windows path to a `path:`-prefixed flakeref pointing at the
 # equivalent location inside WSL. `wslpath` handles drive paths
 # (C:\... -> /mnt/c/...) but mistranslates \\wsl$ UNC paths, so those are
@@ -94,10 +110,7 @@ function ConvertTo-WslFlakeRef {
     if ($WinPath -match '^\\\\wsl(?:\$|\.localhost)\\[^\\]+\\(.*)$') {
         return "path:/$($Matches[1] -replace '\\', '/')"
     }
-    $norm = $WinPath.Replace('\', '/')
-    $wslPath = (wsl.exe -d $WslDistro -- wslpath -a $norm 2>$null).Trim()
-    if (-not $wslPath) { throw "Could not translate Windows path to a WSL path: $WinPath" }
-    return "path:$wslPath"
+    return "path:$(ConvertTo-WslPath $WinPath)"
 }
 
 # Resolve FlakeUri. With no -FlakeUri, use the current directory's flake. A
@@ -233,13 +246,42 @@ function Test-IsAdmin {
     ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+# Run a command in WSL and return its output. The two WSL entry points are this
+# and Invoke-WslStreaming below; nothing else in this file invokes wsl.exe
+# directly, because PowerShell folds a native command's stdout into the
+# enclosing function's return value and every bare call site has to get that
+# right on its own.
+#
+# $PSNativeCommandUseErrorActionPreference is pinned off so the explicit
+# $LASTEXITCODE check owns the failure message; pwsh 7.4+ with
+# $ErrorActionPreference='Stop' would otherwise throw a generic "wsl.exe exited
+# with code N" first. The assignment is function-scoped, so it cannot leak.
 function Invoke-Wsl {
-    param([string]$Cmd)
+    param(
+        [string]$Cmd,
+        # Return the output and leave $LASTEXITCODE to the caller instead of
+        # throwing — for probes whose non-zero exit is an expected outcome.
+        [switch]$NoThrow
+    )
+    $PSNativeCommandUseErrorActionPreference = $false
     $result = wsl.exe -d $WslDistro -u $WslUser -- bash -c $Cmd 2>&1
-    if ($LASTEXITCODE -ne 0) {
+    if (-not $NoThrow -and $LASTEXITCODE -ne 0) {
         throw "WSL command failed (exit $LASTEXITCODE): $Cmd`n$result"
     }
     return $result
+}
+
+# Run a command in WSL whose output is for the human, not the pipeline.
+#
+# Console output MUST be on fd 2 — the caller's command is responsible for
+# putting it there. fd 1 is discarded here, which is what makes this safe to
+# call from a function that returns data: nothing the command prints can reach
+# the enclosing return value. Returns the exit code.
+function Invoke-WslStreaming {
+    param([Parameter(Mandatory)][string]$Cmd)
+    $PSNativeCommandUseErrorActionPreference = $false
+    wsl.exe -d $WslDistro -u $WslUser -- bash -c $Cmd | Out-Null
+    return $LASTEXITCODE
 }
 
 function Invoke-NixBuild {
@@ -260,11 +302,6 @@ function Invoke-NixBuild {
     # goes to a file inside WSL instead, which also leaves PowerShell nothing to
     # capture, so all three std handles stay inherited down to the console.
     #
-    # Disable native-exit auto-throw locally so the explicit $LASTEXITCODE check
-    # below owns the failure message; pwsh 7.4+ with $ErrorActionPreference='Stop'
-    # would otherwise throw a generic "wsl.exe exited with code N". nix's own
-    # error has already streamed to the console above, so "See the build log
-    # above" is accurate.
     # --override-input pairs, quoted for the shell that runs them. These must
     # stay ahead of the redirect below.
     $overrides = ""
@@ -272,24 +309,20 @@ function Invoke-NixBuild {
         $overrides = " " + (($script:OverrideArgs | ForEach-Object { "'$_'" }) -join ' ')
     }
 
-    $PSNativeCommandUseErrorActionPreference = $false
     $outFile = "/tmp/nix-win-outpath.$PID"
     $cmd = "nix build '$Uri' --no-link --print-out-paths --no-write-lock-file$overrides > $outFile"
-    # `1>&2` is load-bearing. PowerShell collects a native command's stdout into
-    # the enclosing function's output, so relaying the pty on fd 1 would splice
-    # every progress-bar frame into this function's return value and the caller
-    # would receive an array of bar frames instead of a store path. Native
-    # stderr is passed straight through to the console untouched, which is
-    # exactly the behaviour the bar wants.
-    wsl.exe -d $WslDistro -u $WslUser -- bash -c "script -qec `"$cmd`" /dev/null 1>&2"
-    $buildExit = $LASTEXITCODE
+    # `1>&2` satisfies Invoke-WslStreaming's contract: the progress bar is
+    # console output, so it belongs on fd 2. Nothing rides fd 1 here anyway —
+    # the store path is redirected to $outFile inside the distro, because a pty
+    # merges stdout and stderr and it would otherwise interleave into the bar.
+    $buildExit = Invoke-WslStreaming "script -qec `"$cmd`" /dev/null 1>&2"
     if ($buildExit -ne 0) {
-        wsl.exe -d $WslDistro -u $WslUser -- rm -f $outFile 2>&1 | Out-Null
+        Invoke-Wsl "rm -f '$outFile'" -NoThrow | Out-Null
         throw "nix build failed (exit $buildExit). See the build log above."
     }
 
-    $output = wsl.exe -d $WslDistro -u $WslUser -- cat $outFile
-    wsl.exe -d $WslDistro -u $WslUser -- rm -f $outFile 2>&1 | Out-Null
+    $output = Invoke-Wsl "cat '$outFile'"
+    Invoke-Wsl "rm -f '$outFile'" -NoThrow | Out-Null
 
     $storePath = "$($output | Select-Object -Last 1)".Trim()
     if (-not $storePath -or -not $storePath.StartsWith("/nix/store/")) {
@@ -826,8 +859,7 @@ $script:StageMarker = $null
 function Sync-SourceToStage {
     param([Parameter(Mandatory)][string]$WinRoot)
 
-    $wslSrc = (wsl.exe -d $WslDistro -- wslpath -a ($WinRoot.Replace('\', '/')) 2>$null).Trim()
-    if (-not $wslSrc) { throw "Could not translate source path to a WSL path: $WinRoot" }
+    $wslSrc = ConvertTo-WslPath $WinRoot -ErrorContext "Could not translate source path to a WSL path"
 
     # One stage per source root, keyed by a digest of the path so two checkouts
     # never collide. The marker lives *beside* the stage, not inside it, because
@@ -929,8 +961,7 @@ function Resolve-InputOverride {
         throw "-InputOverride: $full is not a git checkout (no .git). An override is built from its committed HEAD, so it has to be one."
     }
 
-    $srcWsl = (wsl.exe -d $WslDistro -- wslpath -a ($full.Replace('\', '/')) 2>$null).Trim()
-    if (-not $srcWsl) { throw "-InputOverride: could not translate to a WSL path: $full" }
+    $srcWsl = ConvertTo-WslPath $full -ErrorContext "-InputOverride: could not translate to a WSL path"
 
     $key = [Convert]::ToHexString(
         [System.Security.Cryptography.SHA256]::HashData(
@@ -1015,12 +1046,11 @@ function Invoke-Build {
         # run rebuilds instead of wrongly reusing the older path.
         if (-not $sync.Changed) {
             $prev = Get-State
-            $PSNativeCommandUseErrorActionPreference = $false
-            $built = wsl.exe -d $WslDistro -u $WslUser -- bash -c "cat '$($sync.Marker)' 2>/dev/null" 2>$null
+            $built = Invoke-Wsl "cat '$($sync.Marker)' 2>/dev/null" -NoThrow
             $built = ($built | Select-Object -First 1)
             if ($built) { $built = "$built".Trim() }
             if ($built -and $prev.storePath -and $built -eq $prev.storePath) {
-                wsl.exe -d $WslDistro -u $WslUser -- test -e "$($prev.storePath)" 2>&1 | Out-Null
+                Invoke-Wsl "test -e '$($prev.storePath)'" -NoThrow | Out-Null
                 if ($LASTEXITCODE -eq 0) {
                     $winPath = ConvertTo-WinPath $prev.storePath
                     Write-Host "nix-win: source unchanged, reusing $($prev.storePath)" -ForegroundColor Green
@@ -1346,18 +1376,19 @@ function Invoke-UpdateInput {
     if (-not $script:SourceWinPath) {
         throw "update-input needs a Windows checkout path; pass -FlakeUri C:\path\to\dotfiles (or run from inside it)."
     }
-    $wslPath = (wsl.exe -d $WslDistro -- wslpath -a ($script:SourceWinPath.Replace('\', '/')) 2>$null).Trim()
-    if (-not $wslPath) { throw "Could not translate to a WSL path: $script:SourceWinPath" }
+    $wslPath = ConvertTo-WslPath $script:SourceWinPath -ErrorContext "Could not translate to a WSL path"
 
     Write-Host "nix-win: updating flake input '$InputName' in $script:SourceWinPath ..." -ForegroundColor Cyan
-    $PSNativeCommandUseErrorActionPreference = $false
+    # nix writes its progress and errors to stderr, which satisfies
+    # Invoke-WslStreaming's fd-2 contract.
+    #
     # `nix flake update <input>` is the modern spelling; older nix wants
     # `nix flake lock --update-input <input>`. Try the former, fall back.
-    wsl.exe -d $WslDistro -u $WslUser -- bash -c "cd '$wslPath' && nix flake update '$InputName'"
-    if ($LASTEXITCODE -ne 0) {
+    $rc = Invoke-WslStreaming "cd '$wslPath' && nix flake update '$InputName'"
+    if ($rc -ne 0) {
         Write-Host "nix-win: retrying with the older --update-input spelling..." -ForegroundColor Yellow
-        wsl.exe -d $WslDistro -u $WslUser -- bash -c "cd '$wslPath' && nix flake lock --update-input '$InputName'"
-        if ($LASTEXITCODE -ne 0) { throw "nix flake update failed (exit $LASTEXITCODE)." }
+        $rc = Invoke-WslStreaming "cd '$wslPath' && nix flake lock --update-input '$InputName'"
+        if ($rc -ne 0) { throw "nix flake update failed (exit $rc)." }
     }
     Write-Host "nix-win: '$InputName' updated. Review the flake.lock diff, then switch." -ForegroundColor Green
 }
