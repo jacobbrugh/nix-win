@@ -13,17 +13,22 @@
 let
   winLib = import ../lib { inherit lib pkgs; };
 
-  # Build a single file entry into the store
+  # Resolve an entry to its raw source (path or writeText'd text) plus the
+  # line ending the file branch below should apply.
   buildFile =
     name: entry:
     let
-      source = winLib.mkWinFile {
-        inherit name;
-        inherit (entry) source text lineEnding;
-      };
+      source =
+        if entry.source != null then
+          entry.source
+        else if entry.text != null then
+          pkgs.writeText (baseNameOf name) entry.text
+        else
+          throw "nix-win: environment.files.'${name}' must have either 'source' or 'text'";
+      lineEnding = if entry.lineEnding == "auto" then winLib.autoLineEnding name else entry.lineEnding;
     in
     {
-      inherit name source;
+      inherit name source lineEnding;
       inherit (entry) executable;
     };
 
@@ -33,6 +38,10 @@ let
 
   # Assemble all files into one tree per target root. The CLI copies each
   # <root>/ subtree to the directory Resolve-TargetRoot returns for it.
+  # Directory sources are copied whole (dereferencing store symlinks) with
+  # no line-ending conversion, matching home.file's directory semantics;
+  # the file-vs-directory decision happens at build time, like
+  # home/files.nix's stageEntry.
   filesDerivation = pkgs.runCommand "win-files" { } (
     ''
       mkdir -p $out
@@ -47,8 +56,19 @@ let
         in
         ''
           mkdir -p "${targetDir}"
-          cp "${built.source}" "${targetFile}"
-          ${lib.optionalString built.executable "chmod +x \"${targetFile}\""}
+          src=${lib.escapeShellArg "${built.source}"}
+          if [ -d "$src" ]; then
+            cp -rL --no-preserve=mode "$src" "${targetFile}"
+            chmod -R u+w "${targetFile}"
+          else
+            ${
+              if built.lineEnding == "crlf" then
+                ''sed 's/$/\r/' < "$src" > "${targetFile}"''
+              else
+                ''cp -L "$src" "${targetFile}" && chmod u+w "${targetFile}"''
+            }
+            ${lib.optionalString built.executable "chmod +x \"${targetFile}\""}
+          fi
         ''
       ) builtFiles
     )

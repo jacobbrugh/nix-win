@@ -148,6 +148,23 @@
             echo packaged > $out/bin/check-tool.txt
           '';
 
+          # A directory payload for the directory-source branches of
+          # environment.files / home.file.
+          checkDir = pkgs.runCommand "check-dir" { } ''
+            mkdir -p $out
+            echo in-dir > $out/inner.txt
+          '';
+
+          # A fake staged-uv package source: an entry shim plus modules the
+          # include/exclude filters select between.
+          uvToolSrc = pkgs.runCommand "uv-tool-src" { } ''
+            mkdir -p $out/eval
+            printf '# uv shim\n' > $out/uv_entry.py
+            echo core > $out/core.py
+            echo extra > $out/extra.py
+            echo secret > $out/eval/secret.py
+          '';
+
           # A representative minimal system: exercises the module list, the
           # file tree builder, the packages merge, the activation DAG, and
           # the toplevel assembly.
@@ -158,6 +175,7 @@
                 system.primaryUser = "alice";
                 environment.files."nix-win/eval-check.txt".text = "nix-win eval check";
                 environment.files."nix-win/check.ps1".text = "Write-Host 'crlf check'";
+                environment.files."nix-win/tree".source = checkDir;
                 environment.systemPackages = [ checkPkg ];
               }
             ];
@@ -235,6 +253,39 @@
               };
             };
 
+          # home.stagedUvTools: staging (with both filter modes), launcher
+          # emission, PATH entry, warm-up wiring, and the published
+          # read-only shimPath.
+          stagedUv = self.lib.winHomeConfiguration {
+            inherit pkgs;
+            modules = [
+              {
+                home.username = "alice";
+                home.stateVersion = "0.2";
+                home.stagedUvTools.check-tool = {
+                  packages.check_tool = {
+                    source = uvToolSrc;
+                    exclude = [ "eval" ];
+                  };
+                  launchers = [
+                    "ps1"
+                    "bash"
+                  ];
+                };
+                home.stagedUvTools.pick-tool = {
+                  packages.pick_tool = {
+                    source = uvToolSrc;
+                    include = [
+                      "uv_entry.py"
+                      "core.py"
+                    ];
+                  };
+                  warmup = false;
+                };
+              }
+            ];
+          };
+
           hmCompat = self.lib.winHomeConfiguration {
             inherit pkgs;
             modules = [
@@ -308,6 +359,8 @@
                 set -eu
                 grep -q 'nix-win eval check' "$top/programdata/nix-win/eval-check.txt"
                 grep -q 'packaged' "$top/programdata/nix-win/Programs/check-pkg/bin/check-tool.txt"
+                # Directory sources stage whole (the file branch would fail on one)
+                grep -q 'in-dir' "$top/programdata/nix-win/tree/inner.txt"
                 touch $out
               '';
 
@@ -379,6 +432,52 @@
                 wb=$(grep -n 'writeBoundary' "$ap/activate.ps1" | head -1 | cut -d: -f1)
                 ce=$(grep -n 'check: set-by-module' "$ap/activate.ps1" | head -1 | cut -d: -f1)
                 [ "$wb" -lt "$ce" ]
+
+                touch $out
+              '';
+
+          eval-staged-uv =
+            pkgs.runCommand "nix-win-eval-staged-uv"
+              {
+                ap = stagedUv.activationPackage;
+                shimPath = stagedUv.config.home.stagedUvTools.check-tool.shimPath;
+                command = stagedUv.config.home.stagedUvTools.check-tool.command;
+              }
+              ''
+                set -eu
+                # Published read-only values
+                [ "$shimPath" = "C:/Users/alice/.local/share/check-tool/check_tool/uv_entry.py" ]
+                [ "$command" = "uv run -q --script $shimPath" ]
+
+                # exclude filter: eval/ dropped, everything else staged
+                [ -f "$ap/home/.local/share/check-tool/check_tool/uv_entry.py" ]
+                [ -f "$ap/home/.local/share/check-tool/check_tool/core.py" ]
+                [ -f "$ap/home/.local/share/check-tool/check_tool/extra.py" ]
+                [ ! -e "$ap/home/.local/share/check-tool/check_tool/eval" ]
+
+                # include filter: only the allow-list staged
+                [ -f "$ap/home/.local/share/pick-tool/pick_tool/uv_entry.py" ]
+                [ -f "$ap/home/.local/share/pick-tool/pick_tool/core.py" ]
+                [ ! -e "$ap/home/.local/share/pick-tool/pick_tool/extra.py" ]
+                [ ! -e "$ap/home/.local/share/pick-tool/pick_tool/eval" ]
+
+                # Launchers: .ps1 is CRLF and targets the shim; the bash
+                # launcher is LF with the shebang in the first bytes
+                ps1="$ap/home/.local/bin/check-tool.ps1"
+                grep -q "uv run -q --script \"$shimPath\"" "$ps1"
+                grep -q $'\r' "$ps1"
+                sh="$ap/home/.local/bin/check-tool"
+                head -c 2 "$sh" | grep -q '#!'
+                if grep -q $'\r' "$sh"; then echo "bash launcher has CRLF" >&2; exit 1; fi
+
+                # PATH entry emitted once for the launcher dir
+                grep -Fq '%USERPROFILE%' "$ap/environment/user-path.json"
+
+                # Warm-up present for check-tool, absent for pick-tool
+                grep -q 'check-tool: warming uv script environment' "$ap/activate.ps1"
+                if grep -q 'pick-tool: warming' "$ap/activate.ps1"; then
+                  echo "pick-tool warmup should be disabled" >&2; exit 1
+                fi
 
                 touch $out
               '';

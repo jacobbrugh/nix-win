@@ -3,6 +3,7 @@
   ../misc/assertions.nix
   ./home.nix
   ./files.nix
+  ./staged-uv-tools.nix
   ./packages.nix
   ./session.nix
   ./activation.nix
