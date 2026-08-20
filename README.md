@@ -158,13 +158,15 @@ A complete minimal example lives at
 | `environment.systemPackages` | Machine-scope Nix-built packages (deploy-only) |
 | `scoop`, `winget` | Package managers (top-level, mirroring nix-darwin's `homebrew`) |
 | `programs.powershell.modules` | PowerShell module installation (AllUsers ⇒ admin) |
-| `networking.hosts` | Hosts-file entries (NixOS shape: IP → hostnames) |
+| `programs.openssh` | OpenSSH server configuration |
+| `networking.hosts` | Hosts-file entries (NixOS shape: IP → hostnames), converged natively |
+| `networking.firewall.{allowedTCPPorts, allowedUDPPorts, rules}` | Native firewall rule convergence |
+| `scheduledTasks` | Task Scheduler entries, converged natively |
+| `system.convergeScripts.<name>` | Ordered test/set convergence steps (`{ priority; testScript; setScript; }`) |
+| `services.<name>` | Assertions on the state/startupType of *existing* SCM services |
 | `dsc.*` | PowerShell DSC v3 — see below |
 | `home-manager.{users, sharedModules, extraSpecialArgs}` | Per-user winHome sub-evals |
 | `assertions`, `warnings` | Standard module-system diagnostics |
-
-Transitional: the pre-rename `win.*` spellings are aliased via
-`modules/compat.nix` and will be removed.
 
 ### Class `winHome` (per-user)
 
@@ -174,6 +176,7 @@ Transitional: the pre-rename `win.*` spellings are aliased via
 | `home.file`, `xdg.{configFile, dataFile}` | Dotfiles (home-manager shapes + `lineEnding` extra) |
 | `home.packages` | Per-user Nix-built packages (`passthru.nixWin` for placement) |
 | `home.sessionVariables`, `home.sessionPath` | HKCU environment (state-tracked) |
+| `home.stagedUvTools` | Nix-built Python tools staged under the profile and run natively via uv |
 | `home.activation` | `lib.hm.dag` of PowerShell snippets |
 | `config.lib.file.mkOutOfStoreSymlink` | NTFS junction/symlink to a real Windows path |
 | `programs.git` | `settings`/`ignores`/`attributes` → `~/.config/git/*` |
@@ -200,8 +203,12 @@ is directly usable.
 | `dsc.psdsc.service` | `PSDscResources/Service` |
 | `dsc.psdsc.file` | `PSDesiredStateConfiguration/File` |
 | `dsc.psdsc.{archive, environment, group, …}` | other `PSDscResources/*` |
-| `dsc.ssh.{authorizedKeys, sshdConfig}` | Hand-written SSH config wrapper |
 | `dsc.extraResources` | Raw DSC resource escape hatch |
+
+The grouped `dsc.{firewall, hostsFile, scheduledTasks, psdsc.service, psdsc.file}`
+options predate the native `networking.firewall` / `networking.hosts` /
+`scheduledTasks` / `services` / `environment.files` modules above; prefer the
+native spellings for anything they cover.
 
 Set `dsc.enable = true;` to activate the DSC phase on switch.
 

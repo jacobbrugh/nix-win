@@ -57,6 +57,15 @@ let
     in
     if effectiveLineEnding == "crlf" then toCrlf name rawSource else rawSource;
 
+  # Quote a string as a PowerShell single-quoted literal — the pwsh analog
+  # of lib.escapeShellArg, whose POSIX '\'' escape is garbage to the
+  # PowerShell parser. Inside single quotes pwsh interprets nothing except
+  # '' (a literal quote), so doubling embedded quotes is the complete
+  # escape. Caveat: strings containing double quotes that cross a
+  # native-argument boundary additionally rely on PS 7.3+ Standard
+  # argument passing to survive intact.
+  escapePwsh = s: "'" + lib.replaceStrings [ "'" ] [ "''" ] s + "'";
+
   # Windows path roots mapping
   targetRoots = {
     home = "%USERPROFILE%";
@@ -76,6 +85,7 @@ in
     autoLineEnding
     toCrlf
     mkWinFile
+    escapePwsh
     targetRoots
     ;
   inherit (windowsRust) buildWindowsRustPackage buildWindowsCraneDepsOnly buildWindowsCranePackage;
