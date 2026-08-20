@@ -138,6 +138,12 @@ let
           description = ''
             Launchers to emit in ~/.local/bin as `<binName>.ps1` (PowerShell)
             and/or `<binName>` (Git Bash shebang file).
+
+            Emit a launcher only for a shell that invokes the tool by BARE
+            NAME. A tool started by absolute path, or spawned by another
+            process, needs neither: those callers read `command` / `shimPath`
+            instead. Adding a launcher nothing resolves by name costs a file
+            on PATH and an entry in every PATH scan for no behaviour.
           '';
         };
 
