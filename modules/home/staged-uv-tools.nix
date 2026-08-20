@@ -205,7 +205,17 @@ let
     lib.optionalAttrs (lib.elem "ps1" t.launchers) {
       ".local/bin/${t.binName}.ps1" = {
         text = ''
-          & uv run -q --script "${t.shimPath}" @args
+          # PowerShell hands a script its pipeline input as $input and does
+          # NOT connect that to a child process's stdin, so `x | tool` leaves
+          # a stdin-reading tool seeing EOF and silently processing nothing.
+          # Forward it explicitly. $OutputEncoding governs the bytes handed to
+          # the child and is UTF-8 by default in PowerShell 6+; the console's
+          # own encoding is not involved on this path.
+          if ($MyInvocation.ExpectingInput) {
+            $input | & uv run -q --script "${t.shimPath}" @args
+          } else {
+            & uv run -q --script "${t.shimPath}" @args
+          }
           exit $LASTEXITCODE
         '';
         lineEnding = "crlf";

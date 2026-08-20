@@ -466,6 +466,10 @@
                 ps1="$ap/home/.local/bin/check-tool.ps1"
                 grep -q "uv run -q --script \"$shimPath\"" "$ps1"
                 grep -q $'\r' "$ps1"
+                # Pipeline input must reach the child: a .ps1 receives it as
+                # $input and PowerShell does not wire that to child stdin.
+                grep -q 'MyInvocation.ExpectingInput' "$ps1"
+                grep -q '$input | &' "$ps1"
                 sh="$ap/home/.local/bin/check-tool"
                 head -c 2 "$sh" | grep -q '#!'
                 if grep -q $'\r' "$sh"; then echo "bash launcher has CRLF" >&2; exit 1; fi
