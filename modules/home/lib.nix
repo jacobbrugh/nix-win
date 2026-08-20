@@ -6,7 +6,19 @@
 # instead of a copied file. The argument should be a Windows path string
 # (build it from config.home.homeDirectory); `$env:` references are
 # expanded by the CLI at activation.
-{ lib, ... }:
+#
+# config.lib.nixWin republishes the Windows-specific helpers from nix-win's
+# internal lib that downstream winHome modules legitimately need when
+# authoring home.activation PowerShell (a module's threaded `lib` is the
+# hm-extended nixpkgs lib, which cannot carry them).
+{
+  lib,
+  pkgs,
+  ...
+}:
+let
+  winLib = import ../../lib { inherit lib pkgs; };
+in
 {
   options.lib = lib.mkOption {
     type = lib.types.attrsOf lib.types.attrs;
@@ -20,5 +32,9 @@
   config.lib.file.mkOutOfStoreSymlink = path: {
     _type = "winOutOfStoreSymlink";
     target = toString path;
+  };
+
+  config.lib.nixWin = {
+    inherit (winLib) escapePwsh autoLineEnding;
   };
 }
