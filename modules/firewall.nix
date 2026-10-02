@@ -142,16 +142,32 @@ in
     };
   };
 
-  config = lib.mkIf (enabled != { }) {
+  # Unconditional: the artifact is what the next generation diffs against to
+  # find rules that left the configuration, and the step has to run for the
+  # generation that removed the last rule.
+  config = {
     system.build.firewallRules = specJson;
 
     system.activationScripts.firewall = {
       deps = [ "files" ];
       text = ''
-        Write-Host "nix-win: converging firewall rules..." -ForegroundColor Cyan
-        $fwSpec = Join-Path $env:NIX_WIN_STORE_PATH "firewall\rules.json"
-        $fwDeclared = @(Get-Content -LiteralPath $fwSpec -Raw | ConvertFrom-Json)
+        $fwDeclared = @(Get-NixWinArtifact -Root $env:NIX_WIN_STORE_PATH -RelPath 'firewall', 'rules.json')
+        $fwGone = @(Get-NixWinRemoved -RelPath 'firewall', 'rules.json' -Declared $fwDeclared)
+        if ($fwDeclared.Count -gt 0 -or $fwGone.Count -gt 0) {
+            Write-Host "nix-win: converging firewall rules..." -ForegroundColor Cyan
+        }
 
+        # Rules the previous generation declared and this one does not.
+        foreach ($fwOld in $fwGone) {
+            $fwGoneName = [string]$fwOld.name
+            Invoke-NixWinRemoval -Label "firewall $fwGoneName" -Present {
+                $null -ne (Get-NetFirewallRule -Name $fwGoneName -ErrorAction SilentlyContinue)
+            } -Remove {
+                Remove-NetFirewallRule -Name $fwGoneName -ErrorAction Stop
+            }
+        }
+
+        if ($fwDeclared.Count -gt 0) {
         # Fetch every rule and every filter type ONCE and correlate by
         # InstanceID. This is the whole point of replacing NetworkingDsc:
         # asking for one rule's filters via -AssociatedNetFirewallRule is a
@@ -304,6 +320,7 @@ in
                 if (@($d.remoteAddress).Count -gt 0) { $fwArgs.RemoteAddress = @($d.remoteAddress) }
                 $null = New-NetFirewallRule @fwArgs
             }
+        }
         }
       '';
     };

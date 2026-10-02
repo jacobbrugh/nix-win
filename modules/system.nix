@@ -171,6 +171,35 @@ in
         description = "Generated firewall rule declaration (JSON).";
       };
 
+      convergeScripts = lib.mkOption {
+        type = lib.types.nullOr lib.types.package;
+        default = null;
+        description = ''
+          Names and unset scripts of this generation's converge scripts
+          (JSON), read by the next generation's activation to undo entries
+          that left the configuration.
+        '';
+      };
+
+      networkingHosts = lib.mkOption {
+        type = lib.types.nullOr lib.types.package;
+        default = null;
+        description = ''
+          The hosts-file names this generation manages (JSON), read by the
+          next generation's activation to drop names that left the
+          configuration.
+        '';
+      };
+
+      registryValues = lib.mkOption {
+        type = lib.types.nullOr lib.types.package;
+        default = null;
+        description = ''
+          The registry values this generation declares, plus declared
+          originals (JSON), consumed by the registry baseline step.
+        '';
+      };
+
       dscConfig = lib.mkOption {
         type = lib.types.nullOr lib.types.package;
         default = null;
@@ -268,6 +297,22 @@ in
     ${lib.optionalString (cfg.build.firewallRules != null) ''
       mkdir -p $out/firewall
       cp ${cfg.build.firewallRules} $out/firewall/rules.json
+    ''}
+
+    # Converge scripts, hosts names, registry values: what this generation
+    # declared, for the next activation to diff against. Copies, not links —
+    # a store symlink does not resolve when read from Windows over \\wsl$.
+    ${lib.optionalString (cfg.build.convergeScripts != null) ''
+      mkdir -p $out/converge-scripts
+      cp ${cfg.build.convergeScripts} $out/converge-scripts/scripts.json
+    ''}
+    ${lib.optionalString (cfg.build.networkingHosts != null) ''
+      mkdir -p $out/networking
+      cp ${cfg.build.networkingHosts} $out/networking/hosts.json
+    ''}
+    ${lib.optionalString (cfg.build.registryValues != null) ''
+      mkdir -p $out/dsc
+      cp ${cfg.build.registryValues} $out/dsc/registry-values.json
     ''}
 
     # DSC

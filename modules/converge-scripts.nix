@@ -15,6 +15,7 @@
 {
   config,
   lib,
+  pkgs,
   ...
 }:
 let
@@ -27,7 +28,24 @@ let
   # reproduces today's behaviour; `priority` exists for the cases where one
   # script genuinely must precede another.
   ordered = lib.sort (a: b: if a.priority != b.priority then a.priority < b.priority else a.name < b.name) (
-    lib.mapAttrsToList (name: s: { inherit name; inherit (s) priority testScript setScript; }) enabled
+    lib.mapAttrsToList (name: s: {
+      inherit name;
+      inherit (s)
+        priority
+        testScript
+        setScript
+        unsetScript
+        ;
+    }) enabled
+  );
+
+  # What this generation declared, and how to undo each entry. The NEXT
+  # generation's activation reads this file from here -- the entry is gone
+  # from its own configuration by then, so the recipe has to travel with the
+  # generation that still had it. nix-darwin's system.patches works the same
+  # way: a removed patch is reversed from /run/current-system/patches.
+  scriptsJson = pkgs.writeText "converge-scripts.json" (
+    builtins.toJSON (map (s: { inherit (s) name unsetScript; }) ordered)
   );
 
   # PowerShell single-quoted literal: the only escape is a doubled quote.
@@ -84,16 +102,71 @@ in
             type = lib.types.lines;
             description = "PowerShell that establishes the desired state. Runs only when testScript returned false.";
           };
+
+          unsetScript = lib.mkOption {
+            type = lib.types.nullOr lib.types.lines;
+            default = null;
+            description = ''
+              PowerShell that puts back what `setScript` changed. Runs once,
+              on the switch after this entry leaves the configuration (it was
+              deleted, or `enable` became false), before the remaining
+              entries converge.
+
+              The text that runs is the copy recorded in the last generation
+              that still declared the entry, so it has to be in place for at
+              least one switch before the entry is removed. Rolling back to a
+              generation that declares the entry runs `setScript` again.
+
+              Keep it idempotent, and safe to run when `setScript` never ran:
+              it also runs when the generation that added the entry is rolled
+              back after a failed activation. A failure is reported and does
+              not fail the switch.
+
+              An entry without one is reported as removed and its changes are
+              left in place.
+            '';
+          };
         };
       }
     );
   };
 
-  config = lib.mkIf (enabled != { }) {
+  # Unconditional: the step also has to run for the generation that removed
+  # the LAST entry, or that entry's unsetScript would never fire.
+  config = {
+    system.build.convergeScripts = scriptsJson;
+
     system.activationScripts.convergeScripts = {
       deps = [ "files" ];
       text = ''
-        Write-Host "nix-win: running convergence checks..." -ForegroundColor Cyan
+        $csDeclared = @(Get-NixWinArtifact -Root $env:NIX_WIN_STORE_PATH -RelPath 'converge-scripts', 'scripts.json')
+        $csGone = @(Get-NixWinRemoved -RelPath 'converge-scripts', 'scripts.json' -Declared $csDeclared)
+        if ($csDeclared.Count -gt 0 -or $csGone.Count -gt 0) {
+            Write-Host "nix-win: running convergence checks..." -ForegroundColor Cyan
+        }
+
+        # Entries that left the configuration, undone in reverse of the order
+        # they were applied in (the artifact is priority, name ordered).
+        [array]::Reverse($csGone)
+        foreach ($csOld in $csGone) {
+            $csName = [string]$csOld.name
+            $csProp = $csOld.PSObject.Properties['unsetScript']
+            if ($null -eq $csProp -or [string]::IsNullOrWhiteSpace([string]$csProp.Value)) {
+                Write-Host "  $csName removed from configuration, no unsetScript (its changes stay)" -ForegroundColor DarkYellow
+                continue
+            }
+            try {
+                # A parse error in the recorded text lands in the catch too.
+                $csBlock = [scriptblock]::Create([string]$csProp.Value)
+                $csSw = [System.Diagnostics.Stopwatch]::StartNew()
+                & $csBlock | Out-Host
+                Write-Host "  $csName reverted ($([int]$csSw.Elapsed.TotalMilliseconds) ms)" -ForegroundColor Yellow
+            } catch {
+                $script:NixWinRemovalWarnings.Add("unset $csName`: $($_.Exception.Message)")
+                Write-Host "  $csName UNSET FAILED: $($_.Exception.Message)" -ForegroundColor Red
+            }
+        }
+
         ${lib.concatMapStringsSep "\n" renderOne ordered}
       '';
     };

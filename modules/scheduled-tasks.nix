@@ -233,7 +233,11 @@ in
     );
   };
 
-  config = lib.mkIf (enabled != { }) {
+  # Unconditional: the artifact is what the NEXT generation diffs against to
+  # find tasks that left the configuration, and the step has to run for the
+  # generation that removed the last task. nix-darwin's launchd step is
+  # unconditional for the same reason.
+  config = {
     assertions = lib.flatten (
       lib.mapAttrsToList (name: t: [
         {
@@ -268,9 +272,27 @@ in
     system.activationScripts.scheduledTasks = {
       deps = [ "files" ];
       text = ''
-        Write-Host "nix-win: converging scheduled tasks..." -ForegroundColor Cyan
-        $stSpec = Join-Path $env:NIX_WIN_STORE_PATH "scheduled-tasks\tasks.json"
-        $stDeclared = @(Get-Content -LiteralPath $stSpec -Raw | ConvertFrom-Json)
+        $stDeclared = @(Get-NixWinArtifact -Root $env:NIX_WIN_STORE_PATH -RelPath 'scheduled-tasks', 'tasks.json')
+        $stGone = @(Get-NixWinRemoved -RelPath 'scheduled-tasks', 'tasks.json' -Declared $stDeclared)
+        if ($stDeclared.Count -gt 0 -or $stGone.Count -gt 0) {
+            Write-Host "nix-win: converging scheduled tasks..." -ForegroundColor Cyan
+        }
+
+        # Tasks the previous generation declared and this one does not: stop
+        # and unregister, as nix-darwin unloads a launchd daemon that left the
+        # configuration. -TaskPath '\' because tasks are registered in the
+        # root folder and a bare -TaskName matches in every folder.
+        foreach ($stOld in $stGone) {
+            # $stGoneName, not $name: the scriptblocks run inside
+            # Invoke-NixWinRemoval, whose own parameters would shadow it.
+            $stGoneName = [string]$stOld.name
+            Invoke-NixWinRemoval -Label "task $stGoneName" -Present {
+                $null -ne (Get-ScheduledTask -TaskPath '\' -TaskName $stGoneName -ErrorAction SilentlyContinue)
+            } -Remove {
+                Stop-ScheduledTask -TaskPath '\' -TaskName $stGoneName -ErrorAction SilentlyContinue
+                Unregister-ScheduledTask -TaskPath '\' -TaskName $stGoneName -Confirm:$false -ErrorAction Stop
+            }
+        }
 
         # ONE bulk query for every task on the machine. Filtered per-task
         # lookups cost a full CIM round trip each (measured at 4.87 s for nine
@@ -279,7 +301,9 @@ in
         # far cheaper. Get-ScheduledTaskInfo is deliberately NOT called: no
         # declared field needs it, and it is another round trip per task.
         $stAll = @{}
-        foreach ($t in (Get-ScheduledTask)) { $stAll[$t.TaskName] = $t }
+        if ($stDeclared.Count -gt 0) {
+            foreach ($t in (Get-ScheduledTask)) { $stAll[$t.TaskName] = $t }
+        }
 
         foreach ($d in $stDeclared) {
             # $taskName, NOT $name: these scriptblocks run inside

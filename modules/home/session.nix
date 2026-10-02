@@ -73,27 +73,34 @@ in
     };
   };
 
+  # Both steps are unconditional. Stripping what nix-win added last time is
+  # the whole removal mechanism here, and it has to run for the generation
+  # that declares nothing as much as for any other — gated on a non-empty
+  # declaration, removing the LAST entry would never clean it up.
   config = lib.mkMerge [
-    (lib.mkIf (desiredPath != [ ]) {
+    {
       home.build.environmentConfigs.user-path = pkgs.writeText "user-path.json" (
         builtins.toJSON desiredPath
       );
 
       home.activation.sessionPath = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
-        Write-Host "nix-win: updating user PATH..." -ForegroundColor Cyan
-
         $stateDir = Join-Path $env:LOCALAPPDATA "nix-win"
         $pathStateFile = Join-Path $stateDir "user-path.json"
         $desiredFile = Join-Path $env:NIX_WIN_HOME_STORE_PATH "environment\user-path.json"
 
-        $desired = @(Get-Content -LiteralPath $desiredFile -Raw | ConvertFrom-Json)
-        if ($desired -isnot [array]) { $desired = @($desired) }
+        $desired = @(Get-Content -LiteralPath $desiredFile -Raw | ConvertFrom-Json | Where-Object { $_ })
 
         $previouslyManaged = @()
         if (Test-Path -LiteralPath $pathStateFile) {
-            $raw = Get-Content -LiteralPath $pathStateFile -Raw | ConvertFrom-Json
-            $previouslyManaged = if ($raw -isnot [array]) { @($raw) } else { $raw }
+            $rawState = Get-Content -LiteralPath $pathStateFile -Raw
+            if (-not [string]::IsNullOrWhiteSpace($rawState)) {
+                $previouslyManaged = @($rawState | ConvertFrom-Json | Where-Object { $_ })
+            }
         }
+
+        # Nothing declared and nothing to take back out: stay silent.
+        if ($desired.Count -gt 0 -or $previouslyManaged.Count -gt 0) {
+        Write-Host "nix-win: updating user PATH..." -ForegroundColor Cyan
 
         # Read the current user PATH raw (no expansion) so we can rewrite it in
         # the same REG_EXPAND_SZ form, and so the strip below can recognise its
@@ -159,29 +166,39 @@ in
         if (-not (Test-Path -LiteralPath $stateDir)) {
             New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
         }
-        ($desired | ConvertTo-Json -Compress) | Set-Content -LiteralPath $pathStateFile -NoNewline
+        # The empty list is written literally: piping an empty array into
+        # ConvertTo-Json sends nothing down the pipeline and leaves a 0-byte
+        # file. -AsArray keeps a single entry from collapsing to a bare string.
+        $pathStateJson = if ($desired.Count -eq 0) { '[]' } else { [string[]]$desired | ConvertTo-Json -AsArray -Compress }
+        Set-Content -LiteralPath $pathStateFile -Value $pathStateJson -NoNewline
+        }
       '';
-    })
+    }
 
-    (lib.mkIf (desiredVars != { }) {
+    {
       home.build.environmentConfigs.session-variables = pkgs.writeText "session-variables.json" (
         builtins.toJSON desiredVars
       );
 
       home.activation.sessionVariables = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
-        Write-Host "nix-win: updating user environment variables..." -ForegroundColor Cyan
-
         $stateDir = Join-Path $env:LOCALAPPDATA "nix-win"
         $varsStateFile = Join-Path $stateDir "session-variables.json"
         $desiredFile = Join-Path $env:NIX_WIN_HOME_STORE_PATH "environment\session-variables.json"
 
         $desired = Get-Content -LiteralPath $desiredFile -Raw | ConvertFrom-Json -AsHashtable
+        if ($null -eq $desired) { $desired = @{} }
 
         $previouslyManaged = @()
         if (Test-Path -LiteralPath $varsStateFile) {
-            $raw = Get-Content -LiteralPath $varsStateFile -Raw | ConvertFrom-Json
-            $previouslyManaged = if ($raw -isnot [array]) { @($raw) } else { $raw }
+            $rawState = Get-Content -LiteralPath $varsStateFile -Raw
+            if (-not [string]::IsNullOrWhiteSpace($rawState)) {
+                $previouslyManaged = @($rawState | ConvertFrom-Json | Where-Object { $_ })
+            }
         }
+
+        # Nothing declared and nothing to take back out: stay silent.
+        if ($desired.Count -gt 0 -or $previouslyManaged.Count -gt 0) {
+        Write-Host "nix-win: updating user environment variables..." -ForegroundColor Cyan
 
         $regKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
         $changed = $false
@@ -215,7 +232,8 @@ in
             New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
         }
         ConvertTo-Json -Compress @($desired.Keys) | Set-Content -LiteralPath $varsStateFile -NoNewline
+        }
       '';
-    })
+    }
   ];
 }

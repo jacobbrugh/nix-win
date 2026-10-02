@@ -170,7 +170,20 @@ let
         }
     }
   '';
+
+  # Helpers for removing what the previous generation declared and for the
+  # registry baseline. Kept as real .ps1 files rather than Nix strings so the
+  # flake checks can run PowerShell's parser and unit tests over exactly the
+  # text that ships (tests/*.ps1).
+  removalPrelude = builtins.readFile ./removal-prelude.ps1;
+  registryPrelude = builtins.readFile ./registry-baseline.ps1;
 in
 {
-  inherit sortActivation mkActivationScript timingPrelude;
+  inherit
+    sortActivation
+    mkActivationScript
+    timingPrelude
+    removalPrelude
+    registryPrelude
+    ;
 }

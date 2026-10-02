@@ -46,13 +46,16 @@ in
   config = {
     # Always register pre/post activation hooks (even if empty)
     # Default activation phases — always present, modules add text via mkBefore/mkAfter.
-    # Chain: preActivation → files → scoop → winget → psmodules → dsc → serviceReloads → postActivation
+    # Chain: preActivation → files → scoop → winget → psmodules → registryBaseline → dsc → serviceReloads → postActivation
     system.activationScripts.preActivation = { text = lib.mkDefault ""; deps = [ ]; };
     system.activationScripts.files = { text = lib.mkDefault ""; deps = [ "preActivation" ]; };
     system.activationScripts.scoop = { text = lib.mkDefault ""; deps = [ "files" ]; };
     system.activationScripts.winget = { text = lib.mkDefault ""; deps = [ "scoop" ]; };
     system.activationScripts.psmodules = { text = lib.mkDefault ""; deps = [ "winget" ]; };
-    system.activationScripts.dsc = { text = lib.mkDefault ""; deps = [ "psmodules" ]; };
+    # registryBaseline records each declared registry value's pre-nix-win
+    # state, so it must run before the dsc phase overwrites those values.
+    system.activationScripts.registryBaseline = { text = lib.mkDefault ""; deps = [ "psmodules" ]; };
+    system.activationScripts.dsc = { text = lib.mkDefault ""; deps = [ "registryBaseline" ]; };
     system.activationScripts.serviceReloads = { text = lib.mkDefault ""; deps = [ "dsc" ]; };
     system.activationScripts.postActivation = { text = lib.mkDefault ""; deps = [ "serviceReloads" ]; };
 
@@ -116,7 +119,15 @@ in
           }
       }
 
+      ${activationLib.removalPrelude}
+
+      ${activationLib.registryPrelude}
+
       ${activationScript}
+
+      # Removals that did not complete are reported, not fatal -- see
+      # Invoke-NixWinRemoval.
+      Write-NixWinRemovalWarnings
 
       if ($script:NixWinFailures.Count -gt 0) {
           throw "nix-win: $($script:NixWinFailures.Count) item(s) failed to converge:`n  " +

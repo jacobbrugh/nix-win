@@ -168,6 +168,74 @@ let
         $env:DSC_RESOURCE_PATH = $prevResourcePath
     }
   '';
+
+  # ── Registry baseline artifact ──────────────────────────────────────
+  # Every registry VALUE this generation declares, in the shape the
+  # baseline step (lib/registry-baseline.ps1) consumes. A disabled dsc module
+  # declares nothing, which releases every value it used to manage.
+  registryEntries = lib.optionalAttrs cfg.enable cfg.resource."Microsoft.Windows/Registry";
+
+  # { String = "x"; DWord = null; … } -> { kind = "String"; data = "x"; }
+  toKindData =
+    valueData:
+    let
+      set = lib.filterAttrs (_: v: v != null) valueData;
+      kinds = lib.attrNames set;
+    in
+    if lib.length kinds != 1 then
+      null
+    else
+      {
+        kind = lib.head kinds;
+        data = set.${lib.head kinds};
+      };
+
+  toRegistryValue =
+    context: e:
+    let
+      kd = if e.valueData == null then null else toKindData e.valueData;
+    in
+    if e.valueData != null && kd == null then
+      throw "nix-win: ${context} (${e.keyPath}\\${toString e.valueName}): valueData must set exactly one of String, ExpandString, MultiString, Binary, DWord, QWord"
+    else
+      { inherit (e) keyPath valueName; } // (if kd == null then { absent = true; } else kd);
+
+  # Tracked: a value that is set, or a value declared absent. An entry with
+  # a valueName but neither is the resource's "ensure the value exists"
+  # form, which carries no data to compare against.
+  declaredValues = lib.concatLists (
+    lib.mapAttrsToList (
+      rname: e:
+      if e.valueName == null then
+        [ ]
+      else if e._exist == false then
+        [
+          {
+            inherit (e) keyPath valueName;
+            absent = true;
+          }
+        ]
+      else if e.valueData != null then
+        [ (toRegistryValue "dsc.resource.\"Microsoft.Windows/Registry\".\"${rname}\"" e) ]
+      else
+        [ ]
+    ) registryEntries
+  );
+
+  # `_exist = false` with no valueName deletes a key and everything under it.
+  keyDeletes = lib.concatLists (
+    lib.mapAttrsToList (
+      _: e: lib.optional (e.valueName == null && e._exist == false) e.keyPath
+    ) registryEntries
+  );
+
+  registryValuesJson = pkgs.writeText "registry-values.json" (
+    builtins.toJSON {
+      values = declaredValues;
+      originals = map (toRegistryValue "dsc.registryOriginals") cfg.registryOriginals;
+      inherit keyDeletes;
+    }
+  );
 in
 {
   imports = [
@@ -191,9 +259,85 @@ in
       default = [ ];
       internal = true;
     };
+
+    registryOriginals = lib.mkOption {
+      default = [ ];
+      example = lib.literalExpression ''
+        [
+          # Was absent before nix-win managed it.
+          { keyPath = "HKLM\\SOFTWARE\\OpenSSH"; valueName = "DefaultShell"; }
+          # Held this data before nix-win managed it.
+          {
+            keyPath = "HKLM\\SYSTEM\\CurrentControlSet\\Control\\FileSystem";
+            valueName = "LongPathsEnabled";
+            valueData.DWord = 0;
+          }
+        ]
+      '';
+      description = ''
+        What a registry value held before nix-win managed it, for values
+        nix-win cannot find that out for itself.
+
+        nix-win records a value's original the first time it writes it, and
+        restores that original when the value's declaration leaves the
+        configuration (it is deleted, or a rollback lands on a generation
+        that does not declare it). That capture is impossible when the value
+        already equals what is declared at the moment nix-win first sees it —
+        a value an earlier nix-win wrote before originals were recorded, or
+        one that happened to be right already. Only then is this list
+        consulted; without an entry here (and outside the Windows policy
+        keys, where the original is known to be "absent") such a value is
+        left in place when its declaration is removed.
+
+        Omit `valueData` to say the value did not exist.
+      '';
+      type = lib.types.listOf (
+        lib.types.submodule {
+          options = {
+            keyPath = lib.mkOption {
+              type = lib.types.str;
+              description = "Registry key, in the form the Registry resource takes (`HKLM\\…`, `HKCU\\…`).";
+            };
+            valueName = lib.mkOption {
+              type = lib.types.str;
+              description = "Value name within the key.";
+            };
+            valueData = lib.mkOption {
+              type = lib.types.nullOr (lib.types.attrsOf lib.types.anything);
+              default = null;
+              description = ''
+                The original data, as exactly one of `String`,
+                `ExpandString`, `MultiString`, `Binary`, `DWord`, `QWord` —
+                the Registry resource's own `valueData` shape. `null` means
+                the value was absent.
+              '';
+            };
+          };
+        }
+      );
+    };
   };
 
-  config = lib.mkIf cfg.enable {
+  config = lib.mkMerge [
+    {
+      system.build.registryValues = registryValuesJson;
+
+      # Runs before the dsc phase (modules/activation.nix), so each declared
+      # value's pre-nix-win state is on disk before the Registry resource
+      # overwrites it. Unconditional: releasing the last managed value needs
+      # the step as much as capturing the first one does.
+      system.activationScripts.registryBaseline.text = ''
+        $rbSpecFile = Join-Path (Join-Path $env:NIX_WIN_STORE_PATH 'dsc') 'registry-values.json'
+        $rbSpec = $null
+        if (Test-Path -LiteralPath $rbSpecFile -PathType Leaf) {
+            $rbSpec = Get-Content -LiteralPath $rbSpecFile -Raw | ConvertFrom-Json
+        }
+        Invoke-NixWinRegistryBaseline -Spec $rbSpec `
+            -BaselinePath (Join-Path (Join-Path $env:LOCALAPPDATA 'nix-win') 'registry-baseline.json')
+      '';
+    }
+
+    (lib.mkIf cfg.enable {
     system.build.dscConfig = dscYaml;
 
     system.activationScripts.dsc.text = ''
@@ -307,5 +451,6 @@ ${restoreBlock}
             Write-Warning "DSC v3 is not installed. Install via: winget install Microsoft.DSC"
         }
       '';
-  };
+    })
+  ];
 }

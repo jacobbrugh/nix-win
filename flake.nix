@@ -324,6 +324,86 @@
             ];
           };
 
+          # A system that declares one of everything the removal machinery
+          # tracks, so the checks can assert what each generation records
+          # about itself for the NEXT activation to diff against.
+          removalFixture = self.lib.winSystem {
+            inherit pkgs;
+            modules = [
+              {
+                system.primaryUser = "alice";
+                scheduledTasks."Check Task" = {
+                  command = "powershell.exe";
+                  runAtLogon = true;
+                };
+                networking.firewall.allowedTCPPorts = [ 22 ];
+                networking.hosts."192.0.2.1" = [ "check.example" ];
+                system.convergeScripts."Check Converge" = {
+                  testScript = "return $true";
+                  setScript = "Write-Host set";
+                  unsetScript = "Write-Host 'unset-marker'";
+                };
+                system.convergeScripts."Disabled Converge" = {
+                  enable = false;
+                  testScript = "return $true";
+                  setScript = "Write-Host set";
+                };
+                dsc.enable = true;
+                dsc.resource."Microsoft.Windows/Registry" = {
+                  "Set A Value" = {
+                    keyPath = "HKLM\\SOFTWARE\\Check";
+                    valueName = "Enabled";
+                    valueData.DWord = 1;
+                  };
+                  "Delete A Value" = {
+                    keyPath = "HKCU\\Software\\Check";
+                    valueName = "Gone";
+                    _exist = false;
+                  };
+                  "Delete A Key" = {
+                    keyPath = "HKLM\\SOFTWARE\\CheckGone";
+                    _exist = false;
+                  };
+                };
+                dsc.registryOriginals = [
+                  {
+                    keyPath = "HKLM\\SOFTWARE\\Check";
+                    valueName = "Enabled";
+                    valueData.DWord = 0;
+                  }
+                  {
+                    keyPath = "HKLM\\SOFTWARE\\Check";
+                    valueName = "WasAbsent";
+                  }
+                ];
+              }
+            ];
+          };
+
+          # A per-user configuration that declares no session PATH entries or
+          # variables: the steps that take previously-managed entries back
+          # out must still be emitted.
+          homeBare = self.lib.winHomeConfiguration {
+            inherit pkgs;
+            modules = [
+              {
+                home.username = "alice";
+                home.stateVersion = "0.2";
+              }
+            ];
+          };
+
+          # Run a PowerShell test script inside the build sandbox.
+          pwshCheck =
+            name: script: args:
+            pkgs.runCommand name { nativeBuildInputs = [ pkgs.powershell ]; } ''
+              export HOME=$TMPDIR
+              export POWERSHELL_TELEMETRY_OPTOUT=1
+              export DOTNET_CLI_TELEMETRY_OPTOUT=1
+              pwsh -NoProfile -NonInteractive -File ${script} ${lib.escapeShellArgs args}
+              touch $out
+            '';
+
           # Negative test: a dep naming a non-existent activation entry must
           # fail evaluation with the migration message (not silently reorder).
           depThrowMsg =
@@ -363,6 +443,99 @@
                 grep -q 'in-dir' "$top/programdata/nix-win/tree/inner.txt"
                 touch $out
               '';
+
+          # Removal works by diffing the previous generation's artifacts
+          # against the new ones, so every generation has to carry them and
+          # every removal step has to be emitted — INCLUDING for a
+          # configuration that declares none of the things involved. Gating
+          # either on "non-empty" is the bug where removing the last task
+          # (rule, host, script, registry value) never cleans it up.
+          eval-removal =
+            pkgs.runCommand "nix-win-eval-removal"
+              {
+                bare = minimal.config.system.build.toplevel;
+                full = removalFixture.config.system.build.toplevel;
+                homeBare = homeBare.activationPackage;
+              }
+              ''
+                set -eu
+
+                # A configuration that declares nothing still records "nothing".
+                [ "$(cat "$bare/scheduled-tasks/tasks.json")" = "[]" ]
+                [ "$(cat "$bare/firewall/rules.json")" = "[]" ]
+                [ "$(cat "$bare/networking/hosts.json")" = "[]" ]
+                [ "$(cat "$bare/converge-scripts/scripts.json")" = "[]" ]
+                grep -q '"values":\[\]' "$bare/dsc/registry-values.json"
+
+                # ...and still runs every removal step.
+                grep -Fq "Get-NixWinRemoved -RelPath 'scheduled-tasks', 'tasks.json'" "$bare/activate.ps1"
+                grep -Fq "Get-NixWinRemoved -RelPath 'firewall', 'rules.json'" "$bare/activate.ps1"
+                grep -Fq "Get-NixWinRemoved -RelPath 'networking', 'hosts.json'" "$bare/activate.ps1"
+                grep -Fq "Get-NixWinRemoved -RelPath 'converge-scripts', 'scripts.json'" "$bare/activate.ps1"
+                grep -q 'Invoke-NixWinRegistryBaseline -Spec' "$bare/activate.ps1"
+                grep -q '^function Get-NixWinRegistryPlan' "$bare/activate.ps1"
+                grep -q 'Write-NixWinRemovalWarnings$' "$bare/activate.ps1"
+
+                # The registry baseline has to run before the dsc phase
+                # overwrites the values it records.
+                rb=$(grep -n '^# ── registryBaseline ' "$bare/activate.ps1" | cut -d: -f1)
+                dsc=$(grep -n '^# ── dsc ' "$bare/activate.ps1" | cut -d: -f1)
+                [ "$rb" -lt "$dsc" ]
+
+                # What a generation records about what it declared.
+                grep -q '"name":"Check Task"' "$full/scheduled-tasks/tasks.json"
+                grep -q '"name":"nix-win-allow-tcp-22"' "$full/firewall/rules.json"
+                grep -q '"name":"check.example"' "$full/networking/hosts.json"
+                grep -q '"name":"Check Converge"' "$full/converge-scripts/scripts.json"
+                grep -q "unset-marker" "$full/converge-scripts/scripts.json"
+                # A disabled entry is not in the generation: disabling it is
+                # removing it.
+                if grep -q 'Disabled Converge' "$full/converge-scripts/scripts.json"; then
+                  echo "disabled converge script recorded as declared" >&2; exit 1
+                fi
+
+                rv="$full/dsc/registry-values.json"
+                grep -q '"data":1,"keyPath":"HKLM\\\\SOFTWARE\\\\Check","kind":"DWord","valueName":"Enabled"' "$rv"
+                grep -q '"absent":true,"keyPath":"HKCU\\\\Software\\\\Check","valueName":"Gone"' "$rv"
+                grep -q '"keyDeletes":\["HKLM\\\\SOFTWARE\\\\CheckGone"\]' "$rv"
+                grep -q '"data":0,"keyPath":"HKLM\\\\SOFTWARE\\\\Check","kind":"DWord","valueName":"Enabled"' "$rv"
+                grep -q '"absent":true,"keyPath":"HKLM\\\\SOFTWARE\\\\Check","valueName":"WasAbsent"' "$rv"
+
+                # The per-user session steps, with nothing declared.
+                [ "$(cat "$homeBare/environment/user-path.json")" = "[]" ]
+                [ "$(cat "$homeBare/environment/session-variables.json")" = "{}" ]
+                grep -q 'environment\\user-path.json' "$homeBare/activate.ps1"
+                grep -q 'environment\\session-variables.json' "$homeBare/activate.ps1"
+
+                touch $out
+              '';
+
+          # PowerShell's own parser over the generated activation scripts
+          # (system, with every removal step populated; home) and over the
+          # sources that ship as-is.
+          parse-powershell = pwshCheck "nix-win-parse-powershell" ./tests/parse.ps1 [
+            "${removalFixture.config.system.build.toplevel}/activate.ps1"
+            "${minimal.config.system.build.toplevel}/activate.ps1"
+            "${homeMinimal.activationPackage}/activate.ps1"
+            "${homeBare.activationPackage}/activate.ps1"
+            "${./pkgs/nix-win/nix-win.ps1}"
+            "${./lib/removal-prelude.ps1}"
+            "${./lib/registry-baseline.ps1}"
+          ];
+
+          # The removal helpers against fixture generations: empty array,
+          # single element, missing artifact, case difference, failures.
+          removal-logic = pwshCheck "nix-win-removal-logic" ./tests/removal-logic.ps1 [
+            "-Prelude"
+            "${./lib/removal-prelude.ps1}"
+          ];
+
+          # The registry baseline's decision function, one case per row of
+          # its capture and release tables.
+          registry-plan = pwshCheck "nix-win-registry-plan" ./tests/registry-plan.ps1 [
+            "-Prelude"
+            "${./lib/registry-baseline.ps1}"
+          ];
 
           eval-home-minimal =
             pkgs.runCommand "nix-win-eval-home-minimal"

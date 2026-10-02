@@ -8,7 +8,16 @@
     to the Windows host by copying files and running activation scripts.
 
 .PARAMETER Command
-    The command to run: build, switch, rollback, list-generations, gc
+    The command to run: build, switch, rollback, switch-generation,
+    list-generations, gc, update-input
+
+    Generations are a Nix profile inside the WSL distro
+    (~/.local/state/nix/profiles/nix-win-<scope>), so each one is a GC root
+    and stays available to roll back to. `rollback` and `switch-generation`
+    re-point the profile and re-activate that generation; nothing is rebuilt.
+
+.PARAMETER Generation
+    The generation number for `switch-generation`.
 
 .PARAMETER Home
     Operate on the per-user (winHome) scope instead of the system scope.
@@ -23,6 +32,7 @@
     nix-win switch -Home
     nix-win build
     nix-win rollback
+    nix-win switch-generation -Generation 12
     nix-win list-generations
     nix-win gc -Keep 5
 #>
@@ -30,8 +40,12 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0, Mandatory)]
-    [ValidateSet("build", "switch", "rollback", "list-generations", "gc", "update-input")]
+    [ValidateSet("build", "switch", "rollback", "switch-generation", "list-generations", "gc", "update-input")]
     [string]$Command,
+
+    # `switch-generation`: which profile generation to activate.
+    [Parameter()]
+    [int]$Generation = 0,
 
     [Parameter()]
     [Alias("Home")]
@@ -157,18 +171,27 @@ function ConvertTo-WslFlakeRef {
 # across the 9p bridge — see the staging block below. A \\wsl$ UNC path is
 # already inside the distro (ext4), and a bare flakeref names something Nix
 # fetches itself, so neither is staged.
+#
+# Resolved lazily, by the commands that build (build, switch, update-input).
+# rollback, switch-generation, list-generations and gc never touch a flake —
+# they act on the profile — so they must work from any directory.
 $script:SourceWinPath = $null
-if (-not $FlakeUri) {
-    $cwdFlake = Join-Path (Get-Location).Path "flake.nix"
-    if (-not (Test-Path $cwdFlake)) {
-        throw "No flake.nix found in $((Get-Location).Path). Pass -FlakeUri <Windows path, WSL path, or flakeref> or cd into a directory containing a flake.nix."
+$script:FlakeResolved = $false
+function Resolve-FlakeUri {
+    if ($script:FlakeResolved) { return }
+    $script:FlakeResolved = $true
+    if (-not $script:FlakeUri) {
+        $cwdFlake = Join-Path (Get-Location).Path "flake.nix"
+        if (-not (Test-Path $cwdFlake)) {
+            throw "No flake.nix found in $((Get-Location).Path). Pass -FlakeUri <Windows path, WSL path, or flakeref> or cd into a directory containing a flake.nix."
+        }
+        if ((Get-Location).Path -match '^[A-Za-z]:[\\/]') { $script:SourceWinPath = (Get-Location).Path }
+        $script:FlakeUri = ConvertTo-WslFlakeRef (Get-Location).Path
     }
-    if ((Get-Location).Path -match '^[A-Za-z]:[\\/]') { $script:SourceWinPath = (Get-Location).Path }
-    $FlakeUri = ConvertTo-WslFlakeRef (Get-Location).Path
-}
-elseif ($FlakeUri -match '^[A-Za-z]:[\\/]' -or $FlakeUri -match '^\\\\') {
-    if ($FlakeUri -match '^[A-Za-z]:[\\/]') { $script:SourceWinPath = $FlakeUri }
-    $FlakeUri = ConvertTo-WslFlakeRef $FlakeUri
+    elseif ($script:FlakeUri -match '^[A-Za-z]:[\\/]' -or $script:FlakeUri -match '^\\\\') {
+        if ($script:FlakeUri -match '^[A-Za-z]:[\\/]') { $script:SourceWinPath = $script:FlakeUri }
+        $script:FlakeUri = ConvertTo-WslFlakeRef $script:FlakeUri
+    }
 }
 
 $StateDir = Join-Path $env:LOCALAPPDATA "nix-win"
@@ -271,7 +294,14 @@ if ((Test-Path $legacyState) -and -not (Test-Path (Join-Path $StateDir "state.sy
 }
 
 $StateFile = Join-Path $StateDir "state.$Scope.json"
-$GenerationsDir = Join-Path $StateDir "generations" | Join-Path -ChildPath $Scope
+
+# Windows-side data that belongs to one generation and cannot live in the
+# store: backups of files nix-win overwrote, and the dsc result document.
+# Numbered by the Nix profile's generation number. (The `generations\` tree
+# next to it is the pre-profile layout — text records of store paths that
+# were never GC roots — and is no longer read or written.)
+$GenerationDataRoot = Join-Path $StateDir "generation-data"
+$GenerationDataDir = Join-Path $GenerationDataRoot $Scope
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -422,6 +452,102 @@ function Save-State {
         New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
     }
     $State | ConvertTo-Json -Depth 10 | Set-Content $Path
+}
+
+# A `files` / `links` map out of state, keyed case-insensitively.
+#
+# State is parsed with `ConvertFrom-Json -AsHashtable`, which yields a
+# case-SENSITIVE table, while the keys are NTFS paths. Comparing them
+# case-sensitively would make a case-only rename (or a root env var that
+# changed casing) look like "this path is no longer deployed" — and the
+# removal pass would then delete the file that was just written.
+function Get-StateTable {
+    param($State, [Parameter(Mandatory)][string]$Name)
+    $table = [hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
+    if ($null -ne $State -and $State.ContainsKey($Name) -and $State[$Name]) {
+        foreach ($key in @($State[$Name].Keys)) { $table[[string]$key] = $State[$Name][$key] }
+    }
+    return $table
+}
+
+# A state field that an older CLI may not have written.
+function Get-StateValue {
+    param($State, [Parameter(Mandatory)][string]$Name, $Default = $null)
+    if ($null -ne $State -and $State.ContainsKey($Name) -and $null -ne $State[$Name]) { return $State[$Name] }
+    return $Default
+}
+
+# ── Generations: a Nix profile inside the distro ───────────────────────────
+#
+# A generation is a link in a Nix profile, exactly as on NixOS, nix-darwin and
+# home-manager: `nix-env -p <profile> --set <path>` records it, the link is a
+# GC root, and rollback is `nix-env --rollback` followed by running that
+# generation's own activation. Nothing is rebuilt.
+#
+# The profile lives where home-manager keeps its own
+# (~/.local/state/nix/profiles), is owned by the WSL user, and needs no root.
+#
+# Every command string below is `$`-free with single-quoted absolute paths.
+# `wsl.exe -u <user> -- bash -c <cmd>` hands the string to the user's LOGIN
+# shell first and only then to bash, so anything either shell would expand is
+# expanded twice, or by the wrong one. The one exception is the state-home
+# lookup, whose expansion is a constant either shell resolves identically.
+$script:NixStateHome = $null
+function Get-ProfilePaths {
+    param([string]$ForScope = $Scope)
+    if (-not $script:NixStateHome) {
+        $resolved = ((Invoke-Wsl 'printf %s "${XDG_STATE_HOME:-$HOME/.local/state}"') -join '').Trim()
+        if ($resolved -notmatch '^/') { throw "nix-win: cannot resolve the WSL state directory (got '$resolved')." }
+        $script:NixStateHome = $resolved
+    }
+    return @{
+        Dir     = "$script:NixStateHome/nix/profiles"
+        Profile = "$script:NixStateHome/nix/profiles/nix-win-$ForScope"
+        RootDir = "$script:NixStateHome/nix-win/gcroots"
+        # The last generation whose activation ran to completion —
+        # home-manager's `current-home`. It is a root of its own, outside the
+        # profile directory, because after a failed switch the profile already
+        # points at the new generation while the machine still runs this one.
+        Root    = "$script:NixStateHome/nix-win/gcroots/current-$ForScope"
+    }
+}
+
+# Parse `readlink <profile>` + `readlink -f <profile>` out of command output.
+# The output is 2>&1-merged with whatever nix-env said, so match, never index.
+function ConvertFrom-ProfileOutput {
+    param($Lines)
+    $gen = $null
+    $path = $null
+    foreach ($line in @($Lines)) {
+        $text = "$line".Trim()
+        if ($text -match '^nix-win-[a-z]+-(\d+)-link$') { $gen = [int]$Matches[1] }
+        elseif ($text -match '^(/nix/store/\S+)$') { $path = $Matches[1] }
+    }
+    if ($null -eq $gen -or -not $path) {
+        throw "nix-win: cannot read the profile state:`n$(@($Lines) -join "`n")"
+    }
+    return @{ Generation = $gen; StorePath = $path }
+}
+
+# Record a store path as the profile's newest generation and return
+# @{ Generation; StorePath }. nix-env reuses the newest generation when it
+# already points at this path, so re-switching an unchanged configuration
+# does not mint a new generation.
+function Set-ProfileGeneration {
+    param([Parameter(Mandatory)][string]$StorePath)
+    $pp = Get-ProfilePaths
+    $p = $pp.Profile
+    return ConvertFrom-ProfileOutput (Invoke-Wsl "mkdir -p '$($pp.Dir)' && nix-env -p '$p' --set '$StorePath' && readlink '$p' && readlink -f '$p'")
+}
+
+# Re-point the profile at its previous generation ($Number = 0) or at a
+# specific one, and return @{ Generation; StorePath }.
+function Switch-ProfileGeneration {
+    param([int]$Number = 0)
+    $pp = Get-ProfilePaths
+    $p = $pp.Profile
+    $how = if ($Number -gt 0) { "--switch-generation $Number" } else { "--rollback" }
+    return ConvertFrom-ProfileOutput (Invoke-Wsl "nix-env -p '$p' $how && readlink '$p' && readlink -f '$p'")
 }
 
 function Resolve-TargetRoot {
@@ -824,22 +950,122 @@ function Publish-ChangedFiles {
     $env:NIX_WIN_CHANGED_FILES = $path
 }
 
-# Record a generation on disk: the generation directory plus
-# store-path.txt / timestamp.txt / manifest.json. rollback and
-# list-generations read these records — a bumped counter without one is
-# a generation that can never be rolled back to.
-function Write-GenerationRecord {
+# The mtime every file in the Nix store carries. Copy-Item preserves it, so a
+# deployed file still bearing it has not been written by anything since
+# nix-win copied it (Deploy-Files relies on the same fact to skip unchanged
+# files).
+$script:StoreStamp = [DateTime]::new(1970, 1, 1, 0, 0, 1, [DateTimeKind]::Utc)
+
+# Delete the files the previous generation deployed and this one does not.
+#
+# Runs AFTER activation, not before it: by then a removed scheduled task has
+# been unregistered and a removed converge script's unset has run, so nothing
+# still needs the files. (NixOS stops a removed unit while its old definition
+# is still loaded for the same reason.)
+#
+# A file is deleted only if it still carries the store stamp. One that was
+# modified since nix-win deployed it is left in place with a warning — the
+# rule home-manager applies to the files it copies rather than links
+# ("contents have diverged").
+#
+# Returns the keys that must stay in state: files that could not be deleted
+# yet (in use), so the next switch tries again.
+function Remove-StaleFiles {
     param(
-        [Parameter(Mandatory)][string]$GenDir,
-        [Parameter(Mandatory)][string]$StorePath,
-        [string]$ManifestPath
+        [Parameter(Mandatory)][hashtable]$PrevFiles,
+        [Parameter(Mandatory)][hashtable]$NewFiles,
+        # Paths the OTHER scope deploys. A file that moved from one scope to
+        # the other is still managed and still stamped; it must not be
+        # deleted by the scope that gave it up.
+        [hashtable]$ProtectedFiles = @{}
     )
-    New-Item -ItemType Directory -Path $GenDir -Force | Out-Null
-    $StorePath | Set-Content (Join-Path $GenDir "store-path.txt")
-    (Get-Date -Format "o") | Set-Content (Join-Path $GenDir "timestamp.txt")
-    if ($ManifestPath -and (Test-Path $ManifestPath)) {
-        Copy-Item $ManifestPath (Join-Path $GenDir "manifest.json")
+    $ci = [System.StringComparer]::OrdinalIgnoreCase
+    $keep = [System.Collections.Generic.HashSet[string]]::new($ci)
+    foreach ($k in $NewFiles.Keys) { [void]$keep.Add([string]$k) }
+    foreach ($k in $ProtectedFiles.Keys) { [void]$keep.Add([string]$k) }
+
+    # Pruning never climbs out of, or removes, a target root. Roots nest
+    # (appdata-local is inside home; system-drive is C:\) and a state key
+    # does not say which root it came from, so stop at any of them.
+    $stop = [System.Collections.Generic.HashSet[string]]::new($ci)
+    foreach ($r in 'home', 'appdata-local', 'appdata-roaming', 'programdata', 'system-drive') {
+        [void]$stop.Add((Resolve-TargetRoot $r).TrimEnd('\'))
     }
+
+    $carry = @{}
+    foreach ($key in @($PrevFiles.Keys)) {
+        if ($keep.Contains([string]$key)) { continue }
+        $path = ([string]$key).Replace('/', '\')
+        $fi = [System.IO.FileInfo]::new($path)
+        if ($fi.Exists) {
+            if ($fi.LastWriteTimeUtc -ne $script:StoreStamp) {
+                Write-Warning "  left in place: $path (no longer managed, but modified since nix-win deployed it)"
+                continue
+            }
+            try {
+                # -Force: copies of store files are read-only.
+                Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+                Write-Status "  removed $path" -ForegroundColor DarkGray
+            } catch {
+                Write-Warning "  cannot remove $path yet ($($_.Exception.Message)); will retry on the next switch"
+                $carry[[string]$key] = @{ status = "removing" }
+                continue
+            }
+        }
+
+        # Prune directories this left empty.
+        $dir = Split-Path $path -Parent
+        while ($dir -and -not $stop.Contains($dir.TrimEnd('\'))) {
+            $di = [System.IO.DirectoryInfo]::new($dir)
+            if ($di.Exists) {
+                # Never a junction or symlink: Deploy-Links owns those, and
+                # deleting through one would touch its target.
+                if ($di.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { break }
+                Sweep-StaleFiles -Directories @($dir)
+                # Non-recursive, so it throws unless the directory is truly
+                # empty — hidden files included.
+                try { [System.IO.Directory]::Delete($dir, $false) } catch { break }
+            }
+            $dir = Split-Path $dir -Parent
+        }
+    }
+    return $carry
+}
+
+# Export the generation being replaced to the activation script, or clear the
+# variable when there is none. This is nix-darwin's /run/current-system and
+# home-manager's $oldGenPath: activation steps diff the old generation's
+# artifacts against their own to find what left the configuration.
+#
+# Cleared explicitly, because `$env:` assignments outlive this script in the
+# calling session and a stale path would be diffed against.
+function Set-OldStorePathEnv {
+    param([string]$OldStorePath)
+    $old = ""
+    if ($OldStorePath) {
+        $unc = ConvertTo-WinPath $OldStorePath
+        if (Test-Path -LiteralPath (Join-Path $unc "manifest.json")) { $old = $unc }
+    }
+    if ($old) { $env:NIX_WIN_OLD_STORE_PATH = $old }
+    else { Remove-Item Env:NIX_WIN_OLD_STORE_PATH -ErrorAction SilentlyContinue }
+}
+
+# Save the file map immediately after the copy pass, as previous ∪ new and
+# before activation runs. If activation then fails (or the switch is
+# interrupted), the files this run copied are still on record, so the next
+# successful switch can remove the ones it does not ship.
+function Save-FilesWriteAhead {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][hashtable]$PrevFiles,
+        [Parameter(Mandatory)][hashtable]$NewFiles
+    )
+    $state = Get-State -Path $Path
+    $union = [hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($k in $PrevFiles.Keys) { $union[[string]$k] = $PrevFiles[$k] }
+    foreach ($k in $NewFiles.Keys) { $union[[string]$k] = $NewFiles[$k] }
+    $state["files"] = $union
+    Save-State -State $state -Path $Path
 }
 
 # ── Commands ───────────────────────────────────────────────────────────────
@@ -918,6 +1144,14 @@ function Sync-SourceToStage {
     $excl = ($script:StageExcludes | ForEach-Object { "--exclude '$_'" }) -join ' '
     $out = Invoke-Wsl "mkdir -p '$stage' && rsync -ai --delete --delete-excluded $excl '$wslSrc/' '$stage/'"
     $changed = @($out | Where-Object { "$_".Trim() }).Count -gt 0
+
+    # A marker describes the tree it was written for. Once the stage moves it
+    # is stale, and it has to go NOW rather than when the next switch
+    # succeeds: if this switch fails after staging, the retry sees an
+    # unchanged stage, and a surviving marker that still equals the recorded
+    # store path would make it "reuse" the previous generation and report
+    # success without ever building the new source.
+    if ($changed) { Invoke-Wsl "rm -f '$marker'" -NoThrow | Out-Null }
 
     return @{ FlakeRef = "path:$stage"; Changed = $changed; Marker = $marker }
 }
@@ -1057,6 +1291,7 @@ function Initialize-InputOverrides {
 }
 
 function Invoke-Build {
+    Resolve-FlakeUri
     if ($script:SourceWinPath) {
         Write-Status "nix-win: staging source on ext4..." -ForegroundColor Cyan
         # Timed separately from the nix invocation: source staging and
@@ -1105,29 +1340,40 @@ function Invoke-Build {
     return @{ StorePath = $storePath; WinPath = $winPath }
 }
 
-# Record which store path the current staged tree produced, so the next switch
-# can skip the build. Called only after a switch has fully succeeded.
-function Set-StageMarker {
+# Close out a successfully activated system generation: root it as the
+# "current" generation, and record which store path the staged tree produced
+# so the next switch can skip the build. One WSL round trip for both.
+#
+# The current root is what guarantees the NEXT switch can still read this
+# generation's artifacts to diff against, whatever happens to the profile in
+# between. The marker is written only on the switch path ($script:StageMarker
+# is unset for rollback and switch-generation, which build nothing).
+function Complete-SystemGeneration {
     param([Parameter(Mandatory)][string]$StorePath)
-    if (-not $script:StageMarker) { return }
-    Invoke-Wsl "printf %s '$StorePath' > '$script:StageMarker'" | Out-Null
+    $pp = Get-ProfilePaths -ForScope "system"
+    $cmd = "mkdir -p '$($pp.RootDir)' && nix-store --realise '$StorePath' --add-root '$($pp.Root)'"
+    if ($script:StageMarker) { $cmd += " && printf %s '$StorePath' > '$script:StageMarker'" }
+    Invoke-Wsl $cmd | Out-Null
 }
 
 # Apply a winHome activation package (the per-user toplevel): deploy the
-# home file tree and links, then run its activation script. Shared by the
-# standalone `switch -Home` flow and the system switch's embedded per-user
+# home file tree and links, run its activation script, then remove the files
+# the previous home generation deployed and this one does not. Shared by the
+# standalone `switch -Home` flow and the system activation's embedded per-user
 # pass. Nothing in here requires elevation.
 function Invoke-HomeApply {
     param(
         [Parameter(Mandatory)][string]$HomeWinPath,
+        # The home scope's state file, for the write-ahead file map.
+        [Parameter(Mandatory)][string]$StatePath,
         [hashtable]$PrevFiles = @{},
         [hashtable]$PrevLinks = @{},
-        # Omitted on rollback: re-deploying a known-managed tree backs
-        # nothing up.
         [string]$BackupDir,
         # See Deploy-Files: set only when this home scope's store path is
         # unchanged since the last successful deploy.
-        [switch]$SourceUnchanged
+        [switch]$SourceUnchanged,
+        # Paths the system scope deploys; see Remove-StaleFiles.
+        [hashtable]$ProtectedFiles = @{}
     )
 
     Write-Status "`nnix-win: deploying home files..." -ForegroundColor Cyan
@@ -1135,6 +1381,7 @@ function Invoke-HomeApply {
         Deploy-Files -WinStorePath $HomeWinPath -PrevFiles $PrevFiles -Roots @("home") `
             -BackupDir $BackupDir -SourceUnchanged:$SourceUnchanged
     }
+    Save-FilesWriteAhead -Path $StatePath -PrevFiles $PrevFiles -NewFiles $newFiles
 
     Write-Status "`nnix-win: deploying home links..." -ForegroundColor Cyan
     $newLinks = Measure-CliPhase -Step 'deploy-home-links' -Body {
@@ -1158,92 +1405,128 @@ function Invoke-HomeApply {
         & $activateScript | Out-Host
     }
 
+    $carry = Remove-StaleFiles -PrevFiles $PrevFiles -NewFiles $newFiles -ProtectedFiles $ProtectedFiles
+    foreach ($k in $carry.Keys) { $newFiles[$k] = $carry[$k] }
+
     return @{ files = $newFiles; links = $newLinks }
+}
+
+# True when the home scope on this machine was last applied as part of a
+# system generation (its store path is `<system toplevel>/users/<name>`).
+# Such a home scope has no generations of its own: it moves with the system
+# generation, the way home-manager-as-a-module does under nix-darwin.
+function Test-HomeIsEmbedded {
+    $homeState = Get-State -Path (Join-Path $StateDir "state.home.json")
+    return ("$(Get-StateValue $homeState 'storePath' '')" -match '/users/[^/]+$')
+}
+
+# Activate a standalone winHome generation: the shared body of
+# `switch -Home`, `rollback -Home` and `switch-generation -Home`.
+function Invoke-HomeActivate {
+    param(
+        [Parameter(Mandatory)][string]$StorePath,
+        [Parameter(Mandatory)][int]$GenerationNumber
+    )
+    if (Test-IsAdmin) {
+        Write-Warning "nix-win: the home scope is being applied elevated. It needs no admin; files created now may carry admin ACLs."
+    }
+    $winPath = ConvertTo-WinPath $StorePath
+    $state = Get-State
+    $prevFiles = Get-StateTable $state 'files'
+    $prevLinks = Get-StateTable $state 'links'
+    $systemFiles = Get-StateTable (Get-State -Path (Join-Path $StateDir "state.system.json")) 'files'
+
+    $result = Invoke-HomeApply -HomeWinPath $winPath -StatePath $StateFile `
+        -PrevFiles $prevFiles -PrevLinks $prevLinks `
+        -BackupDir (Join-Path (Join-Path $GenerationDataDir $GenerationNumber) "backups") `
+        -SourceUnchanged:((Get-StateValue $state 'storePath' '') -eq $StorePath -and $prevFiles.Count -gt 0) `
+        -ProtectedFiles $systemFiles
+
+    Save-State @{
+        currentGeneration = $GenerationNumber
+        storePath         = $StorePath
+        activatedAt       = (Get-Date -Format "o")
+        files             = $result.files
+        links             = $result.links
+    }
 }
 
 # Standalone per-user switch: no elevation needed, and being elevated is
 # actively undesirable (files written by an admin token can pick up ACLs
 # the unelevated user then trips over).
 function Invoke-HomeSwitch {
-    if (Test-IsAdmin) {
-        Write-Warning "nix-win: switch -Home is running elevated. Home scope needs no admin; files created now may carry admin ACLs."
-    }
-
     $build = Invoke-Build
-    $state = Get-State
-    $prevFiles = if ($state.files) { $state.files } else { @{} }
-    $prevLinks = if ($state.ContainsKey('links') -and $state.links) { $state.links } else { @{} }
-
-    $script:NewGeneration = $state.currentGeneration + 1
-    $genDir = Join-Path $GenerationsDir $script:NewGeneration
-    Write-GenerationRecord -GenDir $genDir -StorePath $build.StorePath `
-        -ManifestPath (Join-Path $build.WinPath "manifest.json")
-
-    $result = Invoke-HomeApply -HomeWinPath $build.WinPath -PrevFiles $prevFiles -PrevLinks $prevLinks `
-        -BackupDir (Join-Path $genDir "backups") `
-        -SourceUnchanged:($state.storePath -eq $build.StorePath -and $prevFiles.Count -gt 0)
-
-    Save-State @{
-        currentGeneration = $script:NewGeneration
-        storePath         = $build.StorePath
-        activatedAt       = (Get-Date -Format "o")
-        files             = $result.files
-        links             = $result.links
-    }
-
-    Write-Status "`nnix-win: home switch to generation $($script:NewGeneration) complete." -ForegroundColor Green
+    $gen = Set-ProfileGeneration -StorePath $build.StorePath
+    Invoke-HomeActivate -StorePath $build.StorePath -GenerationNumber $gen.Generation
+    Write-Status "`nnix-win: home switch to generation $($gen.Generation) complete." -ForegroundColor Green
 }
 
-function Invoke-Switch {
-    # The system scope writes ProgramData, HKLM, services, scheduled tasks,
-    # and AllUsers PowerShell modules — all of which need an admin token.
-    # Fail fast with a real message instead of a cascade of access-denied
-    # noise halfway through activation.
-    if (-not (Test-IsAdmin)) {
-        throw "nix-win: 'switch' (system scope) requires an elevated shell. Use 'nix-win switch -Home' for the no-admin per-user scope."
+# Activate a system generation. The ONE path `switch`, `rollback` and
+# `switch-generation` all take — darwin-rebuild's shape: the profile is
+# re-pointed first, then the generation it now names is activated.
+#
+# Order, and why:
+#   1. copy files, and save the file map (previous ∪ new) straight away
+#   2. deploy links
+#   3. export the generation being replaced, for activation to diff against
+#   4. run activate.ps1
+#   5. remove the files that left the configuration (after activation — see
+#      Remove-StaleFiles)
+#   6. save state, root the generation, write the build-skip marker
+#   7. apply the embedded home scope the same way
+function Invoke-Activate {
+    param(
+        [Parameter(Mandatory)][string]$StorePath,
+        [Parameter(Mandatory)][int]$GenerationNumber
+    )
+
+    $winPath = ConvertTo-WinPath $StorePath
+    if (-not (Test-Path -LiteralPath (Join-Path $winPath "manifest.json"))) {
+        throw "nix-win: generation $GenerationNumber ($StorePath) is not readable at $winPath."
     }
 
-    $build = Measure-CliPhase -Step 'build' -Body { Invoke-Build }
     $state = Get-State
-    $prevFiles = if ($state.files) { $state.files } else { @{} }
-    $prevLinks = if ($state.ContainsKey('links') -and $state.links) { $state.links } else { @{} }
+    $prevFiles = Get-StateTable $state 'files'
+    $prevLinks = Get-StateTable $state 'links'
+    $prevStorePath = "$(Get-StateValue $state 'storePath' '')"
+    $prevGeneration = Get-StateValue $state 'currentGeneration' 0
+    $genDataDir = Join-Path $GenerationDataDir $GenerationNumber
 
-    $script:NewGeneration = $state.currentGeneration + 1
-    $genDir = Join-Path $GenerationsDir $script:NewGeneration
-    Write-GenerationRecord -GenDir $genDir -StorePath $build.StorePath `
-        -ManifestPath (Join-Path $build.WinPath "manifest.json")
+    $homeStateFile = Join-Path $StateDir "state.home.json"
+    $homeState = Get-State -Path $homeStateFile
+    $homePrevFiles = Get-StateTable $homeState 'files'
+    $homePrevLinks = Get-StateTable $homeState 'links'
 
     Write-Status "`nnix-win: deploying files..." -ForegroundColor Cyan
-    $newFiles = Measure-CliPhase -Step 'deploy-files' -Generation $build.StorePath -Body {
-        Deploy-Files -WinStorePath $build.WinPath -PrevFiles $prevFiles `
-            -BackupDir (Join-Path $genDir "backups") `
-            -SourceUnchanged:($state.storePath -eq $build.StorePath -and $prevFiles.Count -gt 0)
+    $newFiles = Measure-CliPhase -Step 'deploy-files' -Generation $StorePath -Body {
+        Deploy-Files -WinStorePath $winPath -PrevFiles $prevFiles `
+            -BackupDir (Join-Path $genDataDir "backups") `
+            -SourceUnchanged:($prevStorePath -eq $StorePath -and $prevFiles.Count -gt 0)
     }
+    Save-FilesWriteAhead -Path $StateFile -PrevFiles $prevFiles -NewFiles $newFiles
 
     Write-Status "`nnix-win: deploying links..." -ForegroundColor Cyan
-    $newLinks = Measure-CliPhase -Step 'deploy-links' -Generation $build.StorePath -Body {
-        Deploy-Links -WinStorePath $build.WinPath -PrevLinks $prevLinks
+    $newLinks = Measure-CliPhase -Step 'deploy-links' -Generation $StorePath -Body {
+        Deploy-Links -WinStorePath $winPath -PrevLinks $prevLinks
     }
 
     Write-Status "`nnix-win: running activation scripts..." -ForegroundColor Cyan
-    $env:NIX_WIN_STORE_PATH = $build.WinPath
+    $env:NIX_WIN_STORE_PATH = $winPath
+    Set-OldStorePathEnv -OldStorePath $prevStorePath
     # Where activation steps may drop per-generation artifacts (large tool
     # output that belongs on disk rather than in the console log — see the
     # dsc module, which parks its full result JSON here).
-    $env:NIX_WIN_GENERATION_DIR = $genDir
+    $env:NIX_WIN_GENERATION_DIR = $genDataDir
     Publish-ChangedFiles -Scope "system"
-    $activateScript = Join-Path $build.WinPath "activate.ps1"
+    $activateScript = Join-Path $winPath "activate.ps1"
     if (Test-Path $activateScript) {
         # Wrap the activation call so a throw doesn't silently skip Save-State
         # with nothing but a small default PS error block. The failure mode
         # we're guarding against: activate.ps1 invokes DSC/WinGet/PowerShell
-        # modules, any of which can throw. Before this wrapper, a throw at
-        # that depth produced a generic "ERROR: ..." with no framing, the
-        # script exited, and state.json stayed at the previous generation
-        # with no obvious indication that the generation we just wrote to
-        # disk (gen dir + manifest) was never actually activated.
+        # modules, any of which can throw.
         try {
-            & $activateScript
+            # Out-Host: this function's success stream must stay empty.
+            & $activateScript | Out-Host
         } catch {
             $err = $_
             Write-Status ""
@@ -1251,8 +1534,9 @@ function Invoke-Switch {
             Write-Status " nix-win: ACTIVATION FAILED" -ForegroundColor Red
             Write-Status "════════════════════════════════════════════════════════════════════" -ForegroundColor Red
             Write-Status ""
-            Write-Status "Generation $script:NewGeneration was NOT saved." -ForegroundColor Red
-            Write-Status "Current state remains at generation $($state.currentGeneration)." -ForegroundColor Red
+            Write-Status "Generation $GenerationNumber was NOT activated." -ForegroundColor Red
+            Write-Status "The machine remains at generation $prevGeneration; the profile already names $GenerationNumber." -ForegroundColor Red
+            Write-Status "Fix the configuration and switch again, or 'nix-win rollback'." -ForegroundColor Red
             Write-Status ""
             if ($err.InvocationInfo -and $err.InvocationInfo.PositionMessage) {
                 Write-Status "Failed at:" -ForegroundColor Red
@@ -1274,132 +1558,143 @@ function Invoke-Switch {
         }
     }
 
-    # Update state — only reached on successful activation
-    $newState = @{
-        currentGeneration = $script:NewGeneration
-        storePath         = $build.StorePath
+    # Only reached on successful activation.
+    Write-Status "`nnix-win: removing files that left the configuration..." -ForegroundColor Cyan
+    $carry = Remove-StaleFiles -PrevFiles $prevFiles -NewFiles $newFiles -ProtectedFiles $homePrevFiles
+    foreach ($k in $carry.Keys) { $newFiles[$k] = $carry[$k] }
+
+    Save-State @{
+        currentGeneration = $GenerationNumber
+        storePath         = $StorePath
         activatedAt       = (Get-Date -Format "o")
         files             = $newFiles
         links             = $newLinks
     }
-    Save-State $newState
-
-    # Only now is it true that this staged tree produced a fully applied
-    # generation, so only now may the next switch skip its build.
-    Set-StageMarker -StorePath $build.StorePath
+    Complete-SystemGeneration -StorePath $StorePath
 
     # Embedded per-user scope: apply the current user's home activation
     # package if the toplevel carries one (home-manager integration). Runs
     # AFTER the system phases so scoop/winget-installed tools are on PATH
     # for user activation. Other users' packages are skipped — their
     # profiles belong to them; they run `nix-win switch -Home` themselves.
-    $userDir = Join-Path $build.WinPath "users" | Join-Path -ChildPath $env:USERNAME.ToLower()
+    $userName = $env:USERNAME.ToLower()
+    $userDir = Join-Path (Join-Path $winPath "users") $userName
     if (Test-Path -LiteralPath $userDir) {
         Write-Status "`nnix-win: applying embedded home scope for $env:USERNAME..." -ForegroundColor Cyan
-        $homeStateFile = Join-Path $StateDir "state.home.json"
-        $homeState = Get-State -Path $homeStateFile
-        $homePrevFiles = if ($homeState.files) { $homeState.files } else { @{} }
-        $homePrevLinks = if ($homeState.ContainsKey('links') -and $homeState.links) { $homeState.links } else { @{} }
+        $homeStorePath = "$StorePath/users/$userName"
 
-        # Record the home generation exactly like a standalone `switch
-        # -Home` would — rollback -Home and list-generations -Home read
-        # the on-disk record, not the counter in state.home.json. Note
-        # the home scope's dirs, NOT this invocation's ($GenerationsDir
-        # and $genDir are the system scope's here).
-        $homeGen = $homeState.currentGeneration + 1
-        $homeGenDir = Join-Path $StateDir "generations" |
-            Join-Path -ChildPath "home" | Join-Path -ChildPath $homeGen
-        $homeStorePath = "$($build.StorePath)/users/$($env:USERNAME.ToLower())"
-        Write-GenerationRecord -GenDir $homeGenDir -StorePath $homeStorePath `
-            -ManifestPath (Join-Path $userDir "manifest.json")
+        $homeResult = Invoke-HomeApply -HomeWinPath $userDir -StatePath $homeStateFile `
+            -PrevFiles $homePrevFiles -PrevLinks $homePrevLinks `
+            -BackupDir (Join-Path $genDataDir "home-backups") `
+            -SourceUnchanged:((Get-StateValue $homeState 'storePath' '') -eq $homeStorePath -and $homePrevFiles.Count -gt 0) `
+            -ProtectedFiles $newFiles
 
-        $homeResult = Invoke-HomeApply -HomeWinPath $userDir -PrevFiles $homePrevFiles -PrevLinks $homePrevLinks `
-            -BackupDir (Join-Path $homeGenDir "backups") `
-            -SourceUnchanged:($homeState.storePath -eq $homeStorePath -and $homePrevFiles.Count -gt 0)
-
+        # The embedded home scope has no generations of its own; it carries
+        # the system generation's number.
         Save-State -Path $homeStateFile -State @{
-            currentGeneration = $homeGen
+            currentGeneration = $GenerationNumber
             storePath         = $homeStorePath
             activatedAt       = (Get-Date -Format "o")
             files             = $homeResult.files
             links             = $homeResult.links
         }
     }
-
-    Write-Status "`nnix-win: switch to generation $($script:NewGeneration) complete." -ForegroundColor Green
 }
 
-function Invoke-Rollback {
-    $state = Get-State
-    $prevGen = $state.currentGeneration - 1
-    if ($prevGen -lt 1) {
-        Write-Error "No previous generation to roll back to."
-        return
+function Assert-SystemScopeAdmin {
+    param([Parameter(Mandatory)][string]$Verb)
+    # The system scope writes ProgramData, HKLM, services, scheduled tasks,
+    # and AllUsers PowerShell modules — all of which need an admin token.
+    # Fail fast with a real message instead of a cascade of access-denied
+    # noise halfway through activation.
+    if (-not (Test-IsAdmin)) {
+        throw "nix-win: '$Verb' (system scope) requires an elevated shell."
     }
-    $genDir = Join-Path $GenerationsDir $prevGen
-    $storePathFile = Join-Path $genDir "store-path.txt"
-    if (-not (Test-Path $storePathFile)) {
-        Write-Error "Generation $prevGen state not found at $genDir"
-        return
-    }
-    Write-Status "nix-win: rolling back to generation $prevGen ($Scope scope)" -ForegroundColor Yellow
-    $storePath = (Get-Content $storePathFile).Trim()
-    $winPath = ConvertTo-WinPath $storePath
+}
 
+function Invoke-Switch {
+    Assert-SystemScopeAdmin -Verb "switch"
+    $build = Measure-CliPhase -Step 'build' -Body { Invoke-Build }
+    # The profile moves before activation, as darwin-rebuild and
+    # nixos-rebuild do it. If activation then fails, the profile names the
+    # new generation while state still names the last one that activated.
+    $gen = Set-ProfileGeneration -StorePath $build.StorePath
+    Invoke-Activate -StorePath $build.StorePath -GenerationNumber $gen.Generation
+    Write-Status "`nnix-win: switch to generation $($gen.Generation) complete." -ForegroundColor Green
+}
+
+# rollback / switch-generation: re-point the profile, then activate what it
+# now names. Nothing is built; the generation is a GC root, so it is still
+# in the store.
+function Invoke-ProfileSwitch {
+    param([int]$Number = 0)
+    $verb = if ($Number -gt 0) { "switch-generation" } else { "rollback" }
     if ($HomeScope) {
-        # Home rollback re-deploys the previous generation's files and
-        # links (not just re-running its activation) so removed files
-        # come back. No -BackupDir: re-deploying a known-managed tree
-        # backs nothing up.
-        $state = Get-State
-        $prevFiles = if ($state.files) { $state.files } else { @{} }
-        $prevLinks = if ($state.ContainsKey('links') -and $state.links) { $state.links } else { @{} }
-        $result = Invoke-HomeApply -HomeWinPath $winPath -PrevFiles $prevFiles -PrevLinks $prevLinks
-        Save-State @{
-            currentGeneration = $prevGen
-            storePath         = $storePath
-            activatedAt       = (Get-Date -Format "o")
-            files             = $result.files
-            links             = $result.links
+        if (Test-HomeIsEmbedded) {
+            throw "nix-win: the home scope on this machine is applied as part of the system generation; use '$verb' without -Home."
         }
     } else {
-        # Re-activate from previous store path
-        $env:NIX_WIN_STORE_PATH = $winPath
-        $activateScript = Join-Path $winPath "activate.ps1"
-        if (Test-Path $activateScript) {
-            & $activateScript
-        }
+        Assert-SystemScopeAdmin -Verb $verb
     }
-    Write-Status "nix-win: rolled back to generation $prevGen." -ForegroundColor Green
+    $gen = Switch-ProfileGeneration -Number $Number
+    Write-Status "nix-win: activating generation $($gen.Generation) ($Scope scope): $($gen.StorePath)" -ForegroundColor Yellow
+    if ($HomeScope) {
+        Invoke-HomeActivate -StorePath $gen.StorePath -GenerationNumber $gen.Generation
+    } else {
+        Invoke-Activate -StorePath $gen.StorePath -GenerationNumber $gen.Generation
+    }
+    Write-Status "`nnix-win: now at generation $($gen.Generation)." -ForegroundColor Green
 }
 
 function Invoke-ListGenerations {
-    if (-not (Test-Path $GenerationsDir)) {
-        Write-Status "No generations found." -ForegroundColor Yellow
-        return
-    }
-    $state = Get-State
+    $pp = Get-ProfilePaths
+    $lines = @(Invoke-Wsl "nix-env -p '$($pp.Profile)' --list-generations" -NoThrow)
+    $shown = 0
+    $active = Get-StateValue (Get-State) 'currentGeneration' 0
     # The listing is this command's data, so it goes to stdout via the success
     # stream — not through Write-Status, which is for progress.
-    Get-ChildItem $GenerationsDir -Directory | Sort-Object { [int]$_.Name } | ForEach-Object {
-        $gen = $_.Name
-        $tsFile = Join-Path $_.FullName "timestamp.txt"
-        $ts = if (Test-Path $tsFile) { Get-Content $tsFile } else { "unknown" }
-        $current = if ($gen -eq $state.currentGeneration) { " *" } else { "" }
-        Write-Output "  Generation $gen — $ts$current"
+    #
+    # nix-env marks the generation the PROFILE points at "(current)". That is
+    # not always the one the machine runs: after a failed activation the
+    # profile is one ahead. "(active)" marks the generation state recorded as
+    # activated.
+    foreach ($line in $lines) {
+        $text = "$line".TrimEnd()
+        if ($text -notmatch '^\s*(\d+)\s') { continue }
+        if ([int]$Matches[1] -eq $active) { $text += "   (active)" }
+        Write-Output $text
+        $shown++
+    }
+    if ($shown -eq 0) {
+        $hint = if ($HomeScope -and (Test-HomeIsEmbedded)) { " The home scope here is applied with the system generation." } else { "" }
+        Write-Status "No generations found.$hint" -ForegroundColor Yellow
     }
 }
 
 function Invoke-GC {
-    if (-not (Test-Path $GenerationsDir)) { return }
-    $state = Get-State
-    $gens = Get-ChildItem $GenerationsDir -Directory | Sort-Object { [int]$_.Name } -Descending
-    $toRemove = $gens | Select-Object -Skip $Keep | Where-Object { $_.Name -ne $state.currentGeneration }
-    foreach ($gen in $toRemove) {
-        Write-Status "  Removing generation $($gen.Name)" -ForegroundColor DarkGray
-        Remove-Item $gen.FullName -Recurse -Force
+    if ($Keep -lt 1) { throw "nix-win: -Keep must be at least 1." }
+    $pp = Get-ProfilePaths
+    $p = $pp.Profile
+    # `+N` keeps N generations counting back from the current one, and
+    # anything newer than it; the current generation is never deleted.
+    $lines = @(Invoke-Wsl "nix-env -p '$p' --delete-generations +$Keep && nix-env -p '$p' --list-generations")
+    $alive = @{}
+    foreach ($line in $lines) {
+        if ("$line" -match '^\s*(\d+)\s') { $alive[[int]$Matches[1]] = $true }
+        elseif ("$line".Trim()) { Write-Status "  $("$line".Trim())" -ForegroundColor DarkGray }
     }
-    Write-Status "nix-win: kept $Keep most recent generations." -ForegroundColor Green
+    # Drop the Windows-side data of generations that no longer exist. The
+    # store paths themselves are freed by a Nix garbage collection in the
+    # distro, now that nothing roots them.
+    if (Test-Path -LiteralPath $GenerationDataDir) {
+        foreach ($dir in (Get-ChildItem -LiteralPath $GenerationDataDir -Directory)) {
+            if ($dir.Name -match '^\d+$' -and -not $alive.ContainsKey([int]$dir.Name)) {
+                Write-Status "  removing data of generation $($dir.Name)" -ForegroundColor DarkGray
+                Remove-Item -LiteralPath $dir.FullName -Recurse -Force
+            }
+        }
+    }
+    Write-Status "nix-win: kept the $Keep most recent generations." -ForegroundColor Green
 }
 
 # Update one flake input's lock entry in the flake this invocation points at.
@@ -1409,6 +1704,7 @@ function Invoke-GC {
 # path, and `nix flake update` has to run against the real checkout (not the
 # ext4 mirror) because the point is to WRITE flake.lock where git will see it.
 function Invoke-UpdateInput {
+    Resolve-FlakeUri
     if (-not $script:SourceWinPath) {
         throw "update-input needs a Windows checkout path; pass -FlakeUri C:\path\to\config (or run from inside it)."
     }
@@ -1441,7 +1737,11 @@ switch ($Command) {
     # therefore leaves just the path in the file.
     "build" { (Invoke-Build).StorePath }
     "switch" { if ($HomeScope) { Invoke-HomeSwitch } else { Invoke-Switch } }
-    "rollback" { Invoke-Rollback }
+    "rollback" { Invoke-ProfileSwitch }
+    "switch-generation" {
+        if ($Generation -lt 1) { throw "nix-win: switch-generation needs -Generation <number>; see 'nix-win list-generations'." }
+        Invoke-ProfileSwitch -Number $Generation
+    }
     "list-generations" { Invoke-ListGenerations }
     "gc" { Invoke-GC }
     "update-input" { Invoke-UpdateInput }
