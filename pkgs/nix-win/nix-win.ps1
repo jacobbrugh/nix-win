@@ -1151,7 +1151,14 @@ function Sync-SourceToStage {
     # unchanged stage, and a surviving marker that still equals the recorded
     # store path would make it "reuse" the previous generation and report
     # success without ever building the new source.
-    if ($changed) { Invoke-Wsl "rm -f '$marker'" -NoThrow | Out-Null }
+    #
+    # Every marker for this stage goes, not just this run's: each override set
+    # keeps its own marker, and all of them describe the same staged tree. A
+    # stage moved by a run without overrides would otherwise leave an override
+    # set's marker in place, and a later run with those overrides would find an
+    # unchanged stage and a marker matching the current system — and reuse a
+    # build of the source from before the move.
+    if ($changed) { Invoke-Wsl "rm -f '$base/$key.built' '$base/$key.'*.built" -NoThrow | Out-Null }
 
     return @{ FlakeRef = "path:$stage"; Changed = $changed; Marker = $marker }
 }
@@ -1268,6 +1275,23 @@ function Resolve-InputOverride {
     return @{ Name = $inputName; Ref = $ref; Source = $full }
 }
 
+# Resolve a flakeref to its locked form — the `url` field of
+# `nix flake metadata --json`, which pins rev and/or narHash. --refresh skips
+# the tarball-ttl cache, so a branch that moved in the last hour is seen now.
+# The JSON is one line; the rest of the merged output is nix's progress chatter.
+function Get-LockedFlakeRef {
+    param([Parameter(Mandatory)][string]$Ref)
+    $out = Invoke-Wsl "nix flake metadata --json --refresh '$Ref'" -NoThrow
+    $code = $LASTEXITCODE
+    $json = @($out | Where-Object { "$_".TrimStart().StartsWith('{') })
+    if ($code -ne 0 -or $json.Count -eq 0) {
+        throw "-InputOverride: could not lock $Ref (nix flake metadata exit $code):`n$($out -join "`n")"
+    }
+    $url = ($json[-1] | ConvertFrom-Json).url
+    if (-not $url) { throw "-InputOverride: nix flake metadata returned no locked url for $Ref" }
+    return "$url"
+}
+
 # Resolved once, then reused by every nix invocation in this run.
 $script:OverrideArgs = @()
 $script:OverrideKey = ""
@@ -1278,13 +1302,27 @@ function Initialize-InputOverrides {
     $parts = @()
     foreach ($spec in $InputOverride) {
         $o = Resolve-InputOverride -Spec $spec
-        $script:OverrideArgs += @('--override-input', $o.Name, $o.Ref)
-        $parts += "$($o.Name)=$($o.Ref)"
+        $locked = Get-LockedFlakeRef -Ref $o.Ref
+        if ($locked -ne $o.Ref) {
+            Write-Status "  locked $($o.Name) -> $locked" -ForegroundColor DarkGray
+        }
+        $script:OverrideArgs += @('--override-input', $o.Name, $locked)
+        $parts += "$($o.Name)=$locked"
     }
     # Folded into the stage marker so a changed override forces a rebuild even
     # when the configuration source itself did not move. Without this, switching
     # between two nix-win checkouts would reuse the first one's store path and
     # look like a no-op.
+    #
+    # The key is computed over LOCKED refs. --override-input bypasses the
+    # lock file, so the override ref is the only lock that input has: a ref
+    # naming a branch (`github:o/r/main`) or an unpinned local repo
+    # (`git+file:///home/me/repo`) is re-resolved by every nix evaluation.
+    # Hashing that ref's text would keep the key — and so the skip-the-build
+    # marker — fixed while what it resolves to moves, and the fast path would
+    # reuse a build nix itself would no longer produce. Locking it here, and
+    # building from the same locked ref, makes the key change exactly when the
+    # input's content does.
     $script:OverrideKey = [Convert]::ToHexString(
         [System.Security.Cryptography.SHA256]::HashData(
             [Text.Encoding]::UTF8.GetBytes(($parts -join ';')))).Substring(0, 16).ToLower()

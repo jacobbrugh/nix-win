@@ -135,6 +135,8 @@ nix build .#checks.x86_64-linux.eval-hm-compat
 # Windows-only tests (NTFS, real registry under a scratch HKCU key):
 pwsh -NoProfile -File tests/cli-functions.ps1
 pwsh -NoProfile -File tests/registry-live.ps1
+# needs the WSL distro; scratch $HOME, never the real stage:
+pwsh -NoProfile -File tests/stage-markers-live.ps1
 ```
 
 ## Directory Structure
