@@ -11,6 +11,13 @@
 # run. Borrowing those option names would imply nix-win can define a Windows
 # service, which it cannot. The fields are named for what the Service Control
 # Manager calls them.
+#
+# `services` is a free-form submodule rather than a bare attrsOf, so that other
+# modules can declare their own options under it the way nixpkgs modules do
+# (`options.services = mkOption { type = submodule { options.foo = …; }; }`,
+# merged with this declaration). Only the free-form entries are Windows
+# services; each carries the internal `_windowsService` marker that declared
+# options lack.
 {
   config,
   lib,
@@ -18,7 +25,45 @@
   ...
 }:
 let
-  cfg = config.services;
+  serviceType = lib.types.submodule {
+    options = {
+      _windowsService = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        readOnly = true;
+        internal = true;
+        visible = false;
+        description = "Marks a free-form entry of `services` as a Windows service.";
+      };
+
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = "Whether to manage this service.";
+      };
+
+      state = lib.mkOption {
+        type = lib.types.enum [
+          "Running"
+          "Stopped"
+        ];
+        default = "Running";
+        description = "Desired run state.";
+      };
+
+      startupType = lib.mkOption {
+        type = lib.types.enum [
+          "Automatic"
+          "Manual"
+          "Disabled"
+        ];
+        default = "Automatic";
+        description = "Desired Service Control Manager start type.";
+      };
+    };
+  };
+
+  cfg = lib.filterAttrs (_: s: builtins.isAttrs s && (s._windowsService or false)) config.services;
 
   enabled = lib.filterAttrs (_: s: s.enable) cfg;
 
@@ -36,38 +81,12 @@ in
     default = { };
     description = ''
       Existing Windows services whose run state should be asserted, keyed by
-      service name.
+      service name. Other modules may declare their own options under
+      `services` as well; those are not Windows services.
     '';
-    type = lib.types.attrsOf (
-      lib.types.submodule {
-        options = {
-          enable = lib.mkOption {
-            type = lib.types.bool;
-            default = true;
-            description = "Whether to manage this service.";
-          };
-
-          state = lib.mkOption {
-            type = lib.types.enum [
-              "Running"
-              "Stopped"
-            ];
-            default = "Running";
-            description = "Desired run state.";
-          };
-
-          startupType = lib.mkOption {
-            type = lib.types.enum [
-              "Automatic"
-              "Manual"
-              "Disabled"
-            ];
-            default = "Automatic";
-            description = "Desired Service Control Manager start type.";
-          };
-        };
-      }
-    );
+    type = lib.types.submodule {
+      freeformType = lib.types.attrsOf serviceType;
+    };
   };
 
   config = lib.mkIf (enabled != { }) {

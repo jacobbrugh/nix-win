@@ -16,6 +16,7 @@
 #   serviceConfig.RunAtLoad         (unit wants + WantedBy) runAtLogon
 #   serviceConfig.StartInterval     timerConfig.OnUnitActiveSec  startInterval
 #   serviceConfig.StartCalendarInterval  timerConfig.OnCalendar  startCalendar
+#   (none)                        restartTriggers          restartTriggers
 #
 # Genuinely Windows-only concepts (there is no honest launchd/systemd analogue)
 # are quarantined under `principal` and `multipleInstances` rather than forced
@@ -46,10 +47,19 @@ let
           arguments
           workingDirectory
           runAtLogon
+          runAtUnlock
           startInterval
           multipleInstances
+          executionTimeLimit
           ;
         startCalendar = t.startCalendar;
+        # A digest, not the strings: the artifact only has to tell the next
+        # generation whether they changed.
+        restartStamp =
+          if t.restartTriggers == [ ] then
+            null
+          else
+            builtins.hashString "sha256" (lib.concatStringsSep "\n" t.restartTriggers);
         principal = {
           inherit (t.principal)
             userName
@@ -114,6 +124,60 @@ in
               type = lib.types.bool;
               default = false;
               description = "Trigger the task when the user logs on.";
+            };
+
+            runAtUnlock = lib.mkOption {
+              type = lib.types.bool;
+              default = false;
+              description = ''
+                Also trigger the task when the user unlocks the session (Task
+                Scheduler's SessionUnlock session-state-change trigger, for
+                `principal.userName` when set). It is added beside the task's
+                one schedule trigger, not instead of it.
+
+                This is the second chance a GUI process needs when its logon
+                launch lands in a locked session — a session locked at logon
+                has no foreground window to hand over, so a program that
+                insists on one (komorebi's AllowSetForegroundWindow check)
+                exits, and nothing else would start it again.
+              '';
+            };
+
+            executionTimeLimit = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              example = "PT0S";
+              description = ''
+                How long an instance may run before Task Scheduler stops it,
+                as an ISO 8601 duration. `null` keeps Windows' default of 72
+                hours; `"PT0S"` means no limit.
+
+                A long-running task wants `"PT0S"`: the stop kills only the
+                process the task launched, so a child tree (the pwsh under a
+                `conhost --headless` action, say) survives it, the instance
+                counts as finished, and the next trigger starts a second copy
+                beside the first. An on-demand start (Start-ScheduledTask) is
+                never limited.
+              '';
+            };
+
+            restartTriggers = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ ];
+              description = ''
+                Same idea as systemd's `restartTriggers`: when any of these
+                strings differs from the previous generation's (typically the
+                store paths or generated text the running process loaded),
+                activation stops the task's running instances, kills each
+                instance's whole process tree, and starts the task again. A
+                task whose definition is re-registered is restarted the same
+                way.
+
+                Without it, a long-running task keeps its old payload until it
+                next exits: an unchanged registration leaves a running instance
+                alone, and stopping a task leaves the children of its action
+                process running.
+              '';
             };
 
             startInterval = lib.mkOption {
@@ -258,6 +322,18 @@ in
             + "principal.builtInAccount are mutually exclusive.";
         }
         {
+          assertion =
+            t.executionTimeLimit == null
+            || builtins.match "P([0-9]+D)?(T([0-9]+H)?([0-9]+M)?([0-9]+S)?)?" t.executionTimeLimit != null
+              && !(builtins.elem t.executionTimeLimit [
+                "P"
+                "PT"
+              ]);
+          message =
+            "scheduledTasks.\"${name}\": executionTimeLimit \"${toString t.executionTimeLimit}\" is not "
+            + "an ISO 8601 duration of days, hours, minutes and seconds (e.g. \"PT0S\", \"PT72H\").";
+        }
+        {
           assertion = t.startInterval == null || t.startInterval >= 60;
           message =
             "scheduledTasks.\"${name}\": startInterval is ${toString t.startInterval}s, but "
@@ -303,6 +379,75 @@ in
         $stAll = @{}
         if ($stDeclared.Count -gt 0) {
             foreach ($t in (Get-ScheduledTask)) { $stAll[$t.TaskName] = $t }
+        }
+
+        # Stop a task's running instances and kill each one's whole process
+        # tree. Stop-ScheduledTask (and a re-registration) ends only the
+        # process the task launched; its children keep running. EnginePID is
+        # that launched process. A child is any process whose parent id names a
+        # tree member and which started after it, so a stranger holding a
+        # recycled parent id is left alone.
+        function Stop-NixWinTaskTree([string]$TaskName) {
+            $sched = New-Object -ComObject Schedule.Service
+            $sched.Connect()
+            $roots = @()
+            try {
+                $roots = @(foreach ($i in @($sched.GetFolder('\').GetTask($TaskName).GetInstances(0))) { [int]$i.EnginePID })
+            } catch { return }
+            $procs = @{}
+            $kids = @{}
+            foreach ($p in @(Get-CimInstance Win32_Process)) {
+                $procs[[int]$p.ProcessId] = $p
+                $ppid = [int]$p.ParentProcessId
+                if (-not $kids.ContainsKey($ppid)) { $kids[$ppid] = [System.Collections.Generic.List[int]]::new() }
+                $kids[$ppid].Add([int]$p.ProcessId)
+            }
+            $tree = [System.Collections.Generic.List[int]]::new()
+            $queue = [System.Collections.Generic.Queue[int]]::new()
+            foreach ($r in $roots) { if ($r -gt 0 -and $procs.ContainsKey($r)) { $queue.Enqueue($r) } }
+            while ($queue.Count -gt 0) {
+                $x = $queue.Dequeue()
+                if ($tree.Contains($x)) { continue }
+                $tree.Add($x)
+                if (-not $kids.ContainsKey($x)) { continue }
+                foreach ($c in $kids[$x]) {
+                    if ($c -eq $x -or -not $procs.ContainsKey($c)) { continue }
+                    if ($procs[$c].CreationDate -lt $procs[$x].CreationDate) { continue }
+                    $queue.Enqueue($c)
+                }
+            }
+            Stop-ScheduledTask -TaskPath '\' -TaskName $TaskName -ErrorAction SilentlyContinue
+            foreach ($x in $tree) {
+                Write-Host "  task $TaskName`: stopping pid $x ($($procs[$x].Name))" -ForegroundColor DarkGray
+                Stop-Process -Id $x -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        # restartTriggers: which tasks' payload changed since the generation
+        # being replaced. A previous generation without the stamp (older
+        # nix-win) counts as changed; no previous generation at all counts as
+        # unknown and restarts nothing.
+        $stOldStamp = @{}
+        $stHaveOld = -not [string]::IsNullOrEmpty($env:NIX_WIN_OLD_STORE_PATH)
+        if ($stHaveOld) {
+            foreach ($o in @(Get-NixWinArtifact -Root $env:NIX_WIN_OLD_STORE_PATH -RelPath 'scheduled-tasks', 'tasks.json')) {
+                $oProp = $o.PSObject.Properties['restartStamp']
+                $stOldStamp[[string]$o.name] = if ($null -ne $oProp) { [string]$oProp.Value } else { "" }
+            }
+        }
+        $stRestart = @{}
+        foreach ($d in $stDeclared) {
+            $dProp = $d.PSObject.Properties['restartStamp']
+            if ($null -eq $dProp -or $null -eq $dProp.Value) { continue }
+            $wantStamp = [string]$dProp.Value
+            if ($stHaveOld -and $stOldStamp.ContainsKey([string]$d.name) -and $stOldStamp[[string]$d.name] -ne $wantStamp) {
+                $stRestart[[string]$d.name] = $true
+            }
+        }
+        # Kill first, so a re-registration below cannot orphan the old tree.
+        foreach ($rn in @($stRestart.Keys)) {
+            Write-Host "  task $rn`: restart triggers changed; stopping the running instance" -ForegroundColor DarkGray
+            Stop-NixWinTaskTree $rn
         }
 
         foreach ($d in $stDeclared) {
@@ -357,8 +502,23 @@ in
                 if ("$($p.LogonType)" -ne "$($d.principal.logonType)") { return $false }
                 if ("$($p.RunLevel)" -ne "$($d.principal.runLevel)") { return $false }
                 if ("$($live.Settings.MultipleInstances)" -ne "$($d.multipleInstances)") { return $false }
+                # Parsed, not string-compared: PT72H and P3D are the same limit.
+                if ($null -ne $d.executionTimeLimit) {
+                    try {
+                        $wantLimit = [System.Xml.XmlConvert]::ToTimeSpan("$($d.executionTimeLimit)")
+                        $gotLimit = [System.Xml.XmlConvert]::ToTimeSpan("$($live.Settings.ExecutionTimeLimit)")
+                    } catch { return $false }
+                    if ($gotLimit -ne $wantLimit) { return $false }
+                }
 
-                if ($live.Triggers.Count -lt 1) { return $false }
+                # The schedule trigger first, then the unlock trigger if declared.
+                $wantTriggers = if ($d.runAtUnlock) { 2 } else { 1 }
+                if ($live.Triggers.Count -ne $wantTriggers) { return $false }
+                if ($d.runAtUnlock) {
+                    $u = $live.Triggers[1]
+                    if ("$($u.CimClass.CimClassName)" -ne 'MSFT_TaskSessionStateChangeTrigger') { return $false }
+                    if ([int]$u.StateChange -ne 8) { return $false }
+                }
                 $tr = $live.Triggers[0]
                 $trClass = "$($tr.CimClass.CimClassName)"
                 if ($d.runAtLogon) {
@@ -423,12 +583,38 @@ in
                         -RunLevel $d.principal.runLevel
                 }
 
-                $settings = New-ScheduledTaskSettingsSet -MultipleInstances $d.multipleInstances
+                $triggers = @($trigger)
+                if ($d.runAtUnlock) {
+                    # New-ScheduledTaskTrigger has no session-state triggers;
+                    # build the CIM instance directly. StateChange 8 is
+                    # TASK_SESSION_UNLOCK.
+                    $unlockClass = Get-CimClass -Namespace 'Root/Microsoft/Windows/TaskScheduler' -ClassName 'MSFT_TaskSessionStateChangeTrigger'
+                    $unlock = New-CimInstance -CimClass $unlockClass -ClientOnly
+                    $unlock.StateChange = 8
+                    $unlock.Enabled = $true
+                    if ($null -ne $d.principal.userName) { $unlock.UserId = $d.principal.userName }
+                    $triggers += $unlock
+                }
+
+                $settingsArgs = @{ MultipleInstances = $d.multipleInstances }
+                if ($null -ne $d.executionTimeLimit) {
+                    $settingsArgs.ExecutionTimeLimit = [System.Xml.XmlConvert]::ToTimeSpan("$($d.executionTimeLimit)")
+                }
+                $settings = New-ScheduledTaskSettingsSet @settingsArgs
+
+                # A task with restartTriggers is replaced whole: its running
+                # tree goes before the re-registration and it is started again
+                # after it.
+                $dStamp = $d.PSObject.Properties['restartStamp']
+                if ($null -ne $dStamp -and $null -ne $dStamp.Value -and $stAll.ContainsKey($taskName)) {
+                    Stop-NixWinTaskTree $taskName
+                    $stRestart[$taskName] = $true
+                }
 
                 $register = @{
                     TaskName  = $taskName
                     Action    = $action
-                    Trigger   = $trigger
+                    Trigger   = $triggers
                     Principal = $principal
                     Settings  = $settings
                     Force     = $true
@@ -436,6 +622,11 @@ in
                 if ($null -ne $d.description) { $register.Description = $d.description }
                 $null = Register-ScheduledTask @register
             }
+        }
+
+        foreach ($rn in @($stRestart.Keys)) {
+            Write-Host "  task $rn`: starting" -ForegroundColor DarkGray
+            Start-ScheduledTask -TaskPath '\' -TaskName $rn
         }
       '';
     };
