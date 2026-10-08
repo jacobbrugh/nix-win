@@ -38,6 +38,9 @@ let
       name: pkg:
       { Name = name; Source = pkg.bucket; Info = "64bit"; }
       // lib.optionalAttrs (pkg.version != null) { Version = pkg.version; }
+      # Not a scoopfile field: nix-win's own activation reads it (scoop never
+      # sees this file). Absent when unset, so the artifact only grows.
+      // lib.optionalAttrs (pkg.beforeInstall != "") { BeforeInstall = pkg.beforeInstall; }
     ) cfg.packages;
   };
 
@@ -80,6 +83,23 @@ in
               Enforced by nix-win directly rather than by `scoop import`,
               which ignores the Version field for bucket-sourced entries —
               see the note above `scoopfileContent`.
+            '';
+          };
+          options.beforeInstall = lib.mkOption {
+            type = lib.types.lines;
+            default = "";
+            example = ''& "$env:USERPROFILE\scoop\shims\some-app.exe" --shutdown'';
+            description = ''
+              PowerShell run just before activation installs this package or
+              moves it to a different pinned version, and only then. Use it to
+              stop a running program whose files the install replaces, as an
+              upstream's upgrade instructions ask.
+
+              Its output is shown. A non-zero exit or a throw is reported as a
+              warning and the install still runs: the hook exists to release
+              files, and if they stay locked the install itself fails and is
+              reported. A stop command that fails because the program was not
+              running must not block the install.
             '';
           };
         }
@@ -194,6 +214,18 @@ in
                 }
 
                 if ($null -ne $want) { $spec2 = "$spec2@$want" }
+                if ($a.PSObject.Properties.Name -contains 'BeforeInstall') {
+                    Write-Host "  $($a.Name) beforeInstall" -ForegroundColor DarkGray
+                    try {
+                        $global:LASTEXITCODE = 0
+                        & ([scriptblock]::Create([string]$a.BeforeInstall)) | Out-Host
+                        if ($LASTEXITCODE -ne 0) {
+                            Write-Warning "$($a.Name) beforeInstall exited $LASTEXITCODE; installing anyway"
+                        }
+                    } catch {
+                        Write-Warning "$($a.Name) beforeInstall failed: $($_.Exception.Message); installing anyway"
+                    }
+                }
                 try {
                     Write-Host "  $($a.Name) installing ($reason)" -ForegroundColor Yellow
                     scoop install $spec2
