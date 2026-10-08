@@ -160,12 +160,12 @@ A complete minimal example lives at
 | `system.activationScripts` | Activation DAG (NixOS shape: string or `{ text; deps; }`) |
 | `environment.files` | Machine-scope files under `%ProgramData%` (the `environment.etc` analog) |
 | `environment.systemPackages` | Machine-scope Nix-built packages (deploy-only) |
-| `scoop`, `winget` | Package managers (top-level, mirroring nix-darwin's `homebrew`) |
+| `scoop`, `winget` | Package managers (top-level, mirroring nix-darwin's `homebrew`); `scoop.packages.<name>.beforeInstall` runs before that package is installed or re-pinned, to stop a program whose files the install replaces |
 | `programs.powershell.modules` | PowerShell module installation (AllUsers ⇒ admin) |
 | `programs.openssh` | OpenSSH server configuration |
 | `networking.hosts` | Hosts-file entries (NixOS shape: IP → hostnames), converged natively |
 | `networking.firewall.{allowedTCPPorts, allowedUDPPorts, rules}` | Native firewall rule convergence |
-| `scheduledTasks` | Task Scheduler entries, converged natively; `executionTimeLimit` (`"PT0S"` for a long-running task), `runAtUnlock`, systemd-style `restartTriggers` that kill the running tree and restart the task when they change, and `hideConsole`, which runs a console command through a launcher with no window, inside a job that a task stop kills whole, passing the command's exit code through |
+| `scheduledTasks` | Task Scheduler entries, converged natively; `runAtLogon`, `startInterval` and `startCalendar` combine, plus `runAtUnlock`; `executionTimeLimit` (`"PT0S"` for a long-running task); systemd-style `restartTriggers` that kill the running tree when they change and start the task again once the home scope is applied, holding it disabled until then; and `hideConsole`, which runs a console command through a launcher with no window, inside a job that a task stop kills whole (a child started with `CREATE_BREAKAWAY_FROM_JOB` leaves it), passing the command's exit code through |
 | `system.convergeScripts.<name>` | Ordered test/set convergence steps (`{ priority; testScript; setScript; }`) |
 | `services.<name>` | Assertions on the state/startupType of *existing* SCM services (free-form entries; other modules may declare their own options under `services`) |
 | `dsc.*` | PowerShell DSC v3 — see below |

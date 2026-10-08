@@ -24,7 +24,7 @@ function Assert-Equal {
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $Cli).Path, [ref]$tokens, [ref]$errors)
 if ($errors.Count -gt 0) { throw "nix-win.ps1 does not parse: $($errors[0].Message)" }
-$wanted = 'Write-Status', 'Sweep-StaleFiles', 'Remove-StaleFiles', 'Get-StateTable', 'Get-StateValue', 'ConvertFrom-ProfileOutput'
+$wanted = 'Write-Status', 'Sweep-StaleFiles', 'Remove-StaleFiles', 'Get-StateTable', 'Get-StateValue', 'ConvertFrom-ProfileOutput', 'Start-NixWinDeferredTasks'
 foreach ($name in $wanted) {
     $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
     if ($null -eq $fn) { throw "function $name not found in nix-win.ps1" }
@@ -138,6 +138,30 @@ try {
     $threw = $false
     try { [void](ConvertFrom-ProfileOutput @('error: no profile version older than the current (1) exists')) } catch { $threw = $true }
     Assert-Equal 'unparseable output throws'          $true $threw
+
+    Write-Host "Start-NixWinDeferredTasks"
+    # Functions shadow the ScheduledTasks cmdlets, so nothing real is touched.
+    $script:TaskCalls = [System.Collections.Generic.List[string]]::new()
+    function Enable-ScheduledTask { param($TaskPath, $TaskName, $ErrorAction) $script:TaskCalls.Add("enable $TaskName") }
+    function Start-ScheduledTask {
+        param($TaskPath, $TaskName, $ErrorAction)
+        if ($TaskName -eq 'Broken') { throw 'no such task' }
+        $script:TaskCalls.Add("start $TaskName")
+    }
+    # Written the way the scheduledTasks activation step writes it.
+    $deferFile = Join-Path $sandbox 'deferred-task-starts.json'
+    ConvertTo-Json -InputObject ([string[]]@('First Task', 'Broken', 'Last Task')) | Set-Content -LiteralPath $deferFile -Encoding utf8
+    Start-NixWinDeferredTasks -Path $deferFile 3> $null
+    Assert-Equal 'each task enabled then started, a failure skipped' `
+        'enable First Task|start First Task|enable Broken|enable Last Task|start Last Task' ($script:TaskCalls -join '|')
+    Assert-Equal 'the list is consumed'               $false (Test-Path -LiteralPath $deferFile)
+    $script:TaskCalls.Clear()
+    ConvertTo-Json -InputObject ([string[]]@('Solo')) | Set-Content -LiteralPath $deferFile -Encoding utf8
+    Start-NixWinDeferredTasks -Path $deferFile
+    Assert-Equal 'a one-task list'                    'enable Solo|start Solo' ($script:TaskCalls -join '|')
+    $script:TaskCalls.Clear()
+    Start-NixWinDeferredTasks -Path $deferFile
+    Assert-Equal 'no list, nothing started'           0 $script:TaskCalls.Count
 } finally {
     if (Test-Path -LiteralPath $sandbox) { Remove-Item -LiteralPath $sandbox -Recurse -Force }
 }

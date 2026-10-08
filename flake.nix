@@ -401,6 +401,23 @@
                   runAtLogon = true;
                   restartTriggers = [ "check-payload" ];
                 };
+                # Every schedule trigger kind but the daily one, together.
+                scheduledTasks."Watchdog Task" = {
+                  command = "powershell.exe";
+                  hideConsole = true;
+                  runAtLogon = true;
+                  startInterval = 60;
+                  runAtUnlock = true;
+                  multipleInstances = "IgnoreNew";
+                };
+                scoop.enable = true;
+                scoop.buckets.main = "https://example.com/main";
+                scoop.packages.check-app = {
+                  bucket = "main";
+                  version = "1.0.0";
+                  beforeInstall = "Write-Host before-install-marker";
+                };
+                scoop.packages.plain-app.bucket = "main";
                 networking.firewall.allowedTCPPorts = [ 22 ];
                 networking.hosts."192.0.2.1" = [ "check.example" ];
                 system.convergeScripts."Check Converge" = {
@@ -457,6 +474,24 @@
               }
             ];
           };
+
+          # programs.komorebi with and without a relaunch task.
+          homeKomorebi =
+            relaunchTask:
+            self.lib.winHomeConfiguration {
+              inherit pkgs;
+              modules = [
+                {
+                  home.username = "alice";
+                  home.stateVersion = "0.2";
+                  programs.komorebi = {
+                    enable = true;
+                    configText = "{}";
+                    inherit relaunchTask;
+                  };
+                }
+              ];
+            };
 
           # Run a PowerShell test script inside the build sandbox.
           pwshCheck =
@@ -518,6 +553,7 @@
           eval-removal =
             pkgs.runCommand "nix-win-eval-removal"
               {
+                nativeBuildInputs = [ pkgs.jq ];
                 bare = minimal.config.system.build.toplevel;
                 full = removalFixture.config.system.build.toplevel;
                 homeBare = homeBare.activationPackage;
@@ -560,6 +596,24 @@
                   echo "launcher staged with no hideConsole task" >&2; exit 1
                 fi
                 grep -q 'function Get-NixWinTaskAction' "$full/activate.ps1"
+                # Schedule triggers combine.
+                jq -e '.[] | select(.name == "Watchdog Task")
+                  | .runAtLogon == true and .startInterval == 60 and .runAtUnlock == true' \
+                  "$full/scheduled-tasks/tasks.json" > /dev/null
+                # A restarted task is held, disabled, until the CLI has applied
+                # the home scope; a disabled task is not converged; a
+                # hideConsole instance is stopped through its launcher.
+                grep -Fq 'NIX_WIN_DEFERRED_TASK_STARTS' "$full/activate.ps1"
+                grep -Fq 'Disable-ScheduledTask' "$full/activate.ps1"
+                grep -Fq 'Settings.Enabled -ne $true' "$full/activate.ps1"
+                grep -Fq -e "-ieq 'run-hidden.exe'" "$full/activate.ps1"
+                # scoop beforeInstall is recorded only where set, and run.
+                jq -e '.apps[] | select(.Name == "check-app")
+                  | .BeforeInstall == "Write-Host before-install-marker"' \
+                  "$full/scoop/scoopfile.json" > /dev/null
+                jq -e '.apps[] | select(.Name == "plain-app") | has("BeforeInstall") | not' \
+                  "$full/scoop/scoopfile.json" > /dev/null
+                grep -Fq "beforeInstall" "$full/activate.ps1"
                 grep -q '"name":"nix-win-allow-tcp-22"' "$full/firewall/rules.json"
                 grep -q '"name":"check.example"' "$full/networking/hosts.json"
                 grep -q '"name":"Check Converge"' "$full/converge-scripts/scripts.json"
@@ -595,6 +649,8 @@
             "${homeMinimal.activationPackage}/activate.ps1"
             "${homeBare.activationPackage}/activate.ps1"
             "${stagedUv.activationPackage}/activate.ps1"
+            "${(homeKomorebi null).activationPackage}/activate.ps1"
+            "${(homeKomorebi "Check Launcher").activationPackage}/activate.ps1"
             "${./pkgs/nix-win/nix-win.ps1}"
             "${./lib/removal-prelude.ps1}"
             "${./lib/registry-baseline.ps1}"
@@ -624,6 +680,24 @@
                 grep -q 'winHome eval check' "$ap/home/.config/nix-win/home-check.txt"
                 [ -x "$ap/home/bin/tool.py" ]
                 grep -q 'packaged' "$ap/home/AppData/Local/Programs/check-pkg/bin/check-tool.txt"
+                touch $out
+              '';
+
+          # komorebi reloads its own config, so without a relaunch task
+          # activation runs no komorebic command; with one, it relaunches.
+          eval-komorebi =
+            pkgs.runCommand "nix-win-eval-komorebi"
+              {
+                plain = (homeKomorebi null).activationPackage;
+                relaunch = (homeKomorebi "Check Launcher").activationPackage;
+              }
+              ''
+                set -eu
+                if grep -q 'komorebic' "$plain/activate.ps1"; then
+                  echo "komorebic run without a relaunch task" >&2; exit 1
+                fi
+                grep -Fq 'komorebic stop --bar' "$relaunch/activate.ps1"
+                grep -Fq 'Start-ScheduledTask -TaskName "Check Launcher"' "$relaunch/activate.ps1"
                 touch $out
               '';
 

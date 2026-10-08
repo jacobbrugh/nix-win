@@ -150,15 +150,24 @@ in
                 inside a job object, and exits with the command's exit code, so
                 the task's last result is the command's. Stopping the task, or
                 its `executionTimeLimit` running out, ends the launcher and
-                with it the whole process tree. When the command exits on its
-                own, whatever it deliberately left running keeps running.
+                with it the whole process tree; activation stops such a task the
+                same way. When the command exits on its own, whatever it
+                deliberately left running keeps running.
+
+                A process in the tree that starts a child with
+                CREATE_BREAKAWAY_FROM_JOB puts that child outside the job, so it
+                outlives a stop. No other process leaves the job.
               '';
             };
 
             runAtLogon = lib.mkOption {
               type = lib.types.bool;
               default = false;
-              description = "Trigger the task when the user logs on.";
+              description = ''
+                Trigger the task when the user logs on. Combines with
+                `startInterval` and `startCalendar`: each one set adds its own
+                trigger.
+              '';
             };
 
             runAtUnlock = lib.mkOption {
@@ -168,7 +177,7 @@ in
                 Also trigger the task when the user unlocks the session (Task
                 Scheduler's SessionUnlock session-state-change trigger, for
                 `principal.userName` when set). It is added beside the task's
-                one schedule trigger, not instead of it.
+                schedule triggers, not instead of them.
 
                 This is the second chance a GUI process needs when its logon
                 launch lands in a session that locks at once: a program that
@@ -201,16 +210,23 @@ in
                 Same idea as systemd's `restartTriggers`: when any of these
                 strings differs from the previous generation's (typically the
                 store paths or generated text the running process loaded),
-                activation stops the task's running instances, kills each
-                instance's whole process tree, and starts the task again. A
-                task whose definition is re-registered is restarted the same
-                way.
+                activation stops the task's running instances and starts the
+                task again. A task whose definition is re-registered is
+                restarted the same way.
+
+                The stop ends each instance's whole process tree: for a
+                `hideConsole` task by ending its launcher, whose job takes the
+                tree with it; otherwise by killing the descendants of the
+                action process, since a plain task stop ends only that process.
+
+                The start comes after the per-user (home) scope has been
+                applied, so a payload deployed there is in place when the task
+                runs. Until then the task is disabled, so none of its triggers
+                can start the old payload in the meantime.
 
                 Without it, a long-running task keeps its old payload until it
                 next exits: an unchanged registration leaves a running instance
-                alone. The restart kills the tree itself rather than relying on
-                a task stop, which ends only the action process unless the
-                task sets `hideConsole`.
+                alone.
               '';
             };
 
@@ -220,6 +236,11 @@ in
               description = ''
                 Run every this many seconds, indefinitely. Same meaning as
                 nix-darwin's `launchd.agents.<n>.serviceConfig.StartInterval`.
+                Combines with `runAtLogon` and `startCalendar`.
+
+                With `multipleInstances = "IgnoreNew"` this makes the task a
+                watchdog for a long-running process: each firing is a no-op
+                while an instance runs, and starts one when none does.
 
                 Task Scheduler has no native "every N seconds" trigger, so this
                 is realised as a one-shot trigger at a fixed past instant with a
@@ -248,7 +269,8 @@ in
               default = null;
               description = ''
                 Run daily at this time. Field names and bounds are taken from
-                nix-darwin's `StartCalendarInterval` entries.
+                nix-darwin's `StartCalendarInterval` entries. Combines with
+                `runAtLogon` and `startInterval`.
               '';
             };
 
@@ -340,13 +362,9 @@ in
       lib.mapAttrsToList (name: t: [
         {
           assertion =
-            (lib.count (x: x) [
-              t.runAtLogon
-              (t.startInterval != null)
-              (t.startCalendar != null)
-            ]) == 1;
+            t.runAtLogon || t.startInterval != null || t.startCalendar != null;
           message =
-            "scheduledTasks.\"${name}\": set exactly one of runAtLogon, "
+            "scheduledTasks.\"${name}\": set at least one of runAtLogon, "
             + "startInterval or startCalendar.";
         }
         {
@@ -417,12 +435,23 @@ in
             foreach ($t in (Get-ScheduledTask)) { $stAll[$t.TaskName] = $t }
         }
 
-        # Stop a task's running instances and kill each one's whole process
-        # tree. Stop-ScheduledTask (and a re-registration) ends only the
-        # process the task launched; its children keep running. EnginePID is
-        # that launched process. A child is any process whose parent id names a
-        # tree member and which started after it, so a stranger holding a
-        # recycled parent id is left alone.
+        # Stop a task's running instances and end each one's whole process
+        # tree. EnginePID is the process the task launched.
+        #
+        # An instance launched through the hideConsole launcher owns its tree
+        # through the launcher's job: ending the launcher ends the job, and a
+        # process that deliberately broke away from the job is meant to
+        # survive. So for those, the launcher alone is terminated, and waited
+        # for, so the task is no longer running when this returns. Which kind
+        # an instance is follows from what the live registration launches,
+        # not from the declaration, because a running instance belongs to the
+        # registration that started it.
+        #
+        # For any other task, Stop-ScheduledTask (and a re-registration) ends
+        # only the launched process and its children keep running, so the
+        # descendants are killed by parent id. A child is any process whose
+        # parent id names a tree member and which started after it, so a
+        # stranger holding a recycled parent id is left alone.
         function Stop-NixWinTaskTree([string]$TaskName) {
             $sched = New-Object -ComObject Schedule.Service
             $sched.Connect()
@@ -430,6 +459,23 @@ in
             try {
                 $roots = @(foreach ($i in @($sched.GetFolder('\').GetTask($TaskName).GetInstances(0))) { [int]$i.EnginePID })
             } catch { return }
+            $liveTask = Get-ScheduledTask -TaskPath '\' -TaskName $TaskName -ErrorAction SilentlyContinue
+            $jobOwned = $false
+            if ($null -ne $liveTask -and @($liveTask.Actions).Count -gt 0) {
+                $jobOwned = [System.IO.Path]::GetFileName("$($liveTask.Actions[0].Execute)") -ieq 'run-hidden.exe'
+            }
+            if ($jobOwned) {
+                Stop-ScheduledTask -TaskPath '\' -TaskName $TaskName -ErrorAction SilentlyContinue
+                foreach ($r in $roots) {
+                    if ($r -le 0) { continue }
+                    $engine = $null
+                    try { $engine = [System.Diagnostics.Process]::GetProcessById($r) } catch { continue }
+                    Write-Host "  task $TaskName`: stopping launcher pid $r (its job ends the tree)" -ForegroundColor DarkGray
+                    try { $engine.Kill() } catch { }
+                    $engine.WaitForExit()
+                }
+                return
+            }
             $procs = @{}
             $kids = @{}
             foreach ($p in @(Get-CimInstance Win32_Process)) {
@@ -558,6 +604,10 @@ in
                 if ("$($p.LogonType)" -ne "$($d.principal.logonType)") { return $false }
                 if ("$($p.RunLevel)" -ne "$($d.principal.runLevel)") { return $false }
                 if ("$($live.Settings.MultipleInstances)" -ne "$($d.multipleInstances)") { return $false }
+                # A declared task is an enabled one. Activation disables a task
+                # while it waits for the home scope (see the restart below); one
+                # left disabled by an interrupted switch is re-registered here.
+                if ($live.Settings.Enabled -ne $true) { return $false }
                 # Parsed, not string-compared: PT72H and P3D are the same limit.
                 if ($null -ne $d.executionTimeLimit) {
                     try {
@@ -567,41 +617,51 @@ in
                     if ($gotLimit -ne $wantLimit) { return $false }
                 }
 
-                # The schedule trigger first, then the unlock trigger if declared.
-                $wantTriggers = if ($d.runAtUnlock) { 2 } else { 1 }
-                if ($live.Triggers.Count -ne $wantTriggers) { return $false }
-                if ($d.runAtUnlock) {
-                    $u = $live.Triggers[1]
-                    if ("$($u.CimClass.CimClassName)" -ne 'MSFT_TaskSessionStateChangeTrigger') { return $false }
-                    if ([int]$u.StateChange -ne 8) { return $false }
-                }
-                $tr = $live.Triggers[0]
-                $trClass = "$($tr.CimClass.CimClassName)"
-                if ($d.runAtLogon) {
-                    if ($trClass -ne 'MSFT_TaskLogonTrigger') { return $false }
-                } elseif ($null -ne $d.startCalendar) {
-                    if ($trClass -ne 'MSFT_TaskDailyTrigger') { return $false }
-                    # Only the time-of-day is declared, so compare only that —
-                    # but parse rather than string-match. Task Scheduler returns
-                    # a registered trigger's StartBoundary in local form with an
-                    # offset (2026-08-15T21:00:00-04:00) while a freshly
-                    # constructed one normalises to UTC (2026-08-16T01:00:00Z).
-                    # A substring test on "21:00:00" happens to pass against the
-                    # first and fails against the second, and would flip with
-                    # daylight saving — re-registering the task on every switch,
-                    # which for a keep-alive task means killing it.
-                    $sb = $null
-                    try { $sb = [DateTimeOffset]::Parse("$($tr.StartBoundary)") } catch { return $false }
-                    $local = $sb.LocalDateTime
-                    if ($local.Hour -ne $d.startCalendar.hour) { return $false }
-                    if ($local.Minute -ne $d.startCalendar.minute) { return $false }
-                } elseif ($null -ne $d.startInterval) {
-                    if ($trClass -ne 'MSFT_TaskTimeTrigger') { return $false }
-                    if ($null -eq $tr.Repetition) { return $false }
-                    $want = [TimeSpan]::FromSeconds($d.startInterval)
-                    $got = $null
-                    try { $got = [System.Xml.XmlConvert]::ToTimeSpan("$($tr.Repetition.Interval)") } catch { return $false }
-                    if ($got -ne $want) { return $false }
+                # The live triggers must be exactly the declared set: one per
+                # declared kind, each of a kind declared, none repeated.
+                $wantLogon = [bool]$d.runAtLogon
+                $wantDaily = $null -ne $d.startCalendar
+                $wantInterval = $null -ne $d.startInterval
+                $wantUnlock = [bool]$d.runAtUnlock
+                $wantCount = 0
+                foreach ($w in @($wantLogon, $wantDaily, $wantInterval, $wantUnlock)) { if ($w) { $wantCount++ } }
+                if (@($live.Triggers).Count -ne $wantCount) { return $false }
+                $seen = @{}
+                foreach ($tr in @($live.Triggers)) {
+                    $trClass = "$($tr.CimClass.CimClassName)"
+                    if ($seen.ContainsKey($trClass)) { return $false }
+                    $seen[$trClass] = $true
+                    if ($trClass -eq 'MSFT_TaskLogonTrigger') {
+                        if (-not $wantLogon) { return $false }
+                    } elseif ($trClass -eq 'MSFT_TaskDailyTrigger') {
+                        if (-not $wantDaily) { return $false }
+                        # Only the time-of-day is declared, so compare only that —
+                        # but parse rather than string-match. Task Scheduler returns
+                        # a registered trigger's StartBoundary in local form with an
+                        # offset (2026-08-15T21:00:00-04:00) while a freshly
+                        # constructed one normalises to UTC (2026-08-16T01:00:00Z).
+                        # A substring test on "21:00:00" happens to pass against the
+                        # first and fails against the second, and would flip with
+                        # daylight saving — re-registering the task on every switch,
+                        # which for a keep-alive task means killing it.
+                        $sb = $null
+                        try { $sb = [DateTimeOffset]::Parse("$($tr.StartBoundary)") } catch { return $false }
+                        $local = $sb.LocalDateTime
+                        if ($local.Hour -ne $d.startCalendar.hour) { return $false }
+                        if ($local.Minute -ne $d.startCalendar.minute) { return $false }
+                    } elseif ($trClass -eq 'MSFT_TaskTimeTrigger') {
+                        if (-not $wantInterval) { return $false }
+                        if ($null -eq $tr.Repetition) { return $false }
+                        $wantSpan = [TimeSpan]::FromSeconds($d.startInterval)
+                        $gotSpan = $null
+                        try { $gotSpan = [System.Xml.XmlConvert]::ToTimeSpan("$($tr.Repetition.Interval)") } catch { return $false }
+                        if ($gotSpan -ne $wantSpan) { return $false }
+                    } elseif ($trClass -eq 'MSFT_TaskSessionStateChangeTrigger') {
+                        if (-not $wantUnlock) { return $false }
+                        if ([int]$tr.StateChange -ne 8) { return $false }
+                    } else {
+                        return $false
+                    }
                 }
                 return $true
             } -Set {
@@ -611,18 +671,22 @@ in
                 if ($null -ne $d.workingDirectory) { $actionArgs.WorkingDirectory = $d.workingDirectory }
                 $action = New-ScheduledTaskAction @actionArgs
 
+                # One trigger per declared kind.
+                $triggers = @()
                 if ($d.runAtLogon) {
-                    $trigger = if ($null -ne $d.principal.userName) {
-                        New-ScheduledTaskTrigger -AtLogOn -User $d.principal.userName
+                    if ($null -ne $d.principal.userName) {
+                        $triggers += New-ScheduledTaskTrigger -AtLogOn -User $d.principal.userName
                     } else {
-                        New-ScheduledTaskTrigger -AtLogOn
+                        $triggers += New-ScheduledTaskTrigger -AtLogOn
                     }
-                } elseif ($null -ne $d.startCalendar) {
+                }
+                if ($null -ne $d.startCalendar) {
                     $at = Get-Date -Hour $d.startCalendar.hour -Minute $d.startCalendar.minute -Second 0
-                    $trigger = New-ScheduledTaskTrigger -Daily -At $at
-                } else {
+                    $triggers += New-ScheduledTaskTrigger -Daily -At $at
+                }
+                if ($null -ne $d.startInterval) {
                     # Once + repetition = "every N seconds, forever".
-                    $trigger = New-ScheduledTaskTrigger -Once -At ([DateTime]::Parse($d.intervalStart)) `
+                    $triggers += New-ScheduledTaskTrigger -Once -At ([DateTime]::Parse($d.intervalStart)) `
                         -RepetitionInterval ([TimeSpan]::FromSeconds($d.startInterval))
                 }
 
@@ -637,7 +701,6 @@ in
                         -RunLevel $d.principal.runLevel
                 }
 
-                $triggers = @($trigger)
                 if ($d.runAtUnlock) {
                     # New-ScheduledTaskTrigger has no session-state triggers;
                     # build the CIM instance directly. StateChange 8 is
@@ -678,9 +741,29 @@ in
             }
         }
 
+        # Start the restarted tasks. A CLI that applies the home scope after
+        # this script names a file in NIX_WIN_DEFERRED_TASK_STARTS: the tasks
+        # are then held, disabled so no trigger can start the old payload, and
+        # the CLI enables and starts them once the home scope is in place. A
+        # trigger may have fired between the stop above and the disable, so
+        # each is stopped once more after it is disabled. Without the variable
+        # (an older CLI), they start now.
+        $stDeferFile = $env:NIX_WIN_DEFERRED_TASK_STARTS
+        $stDeferred = [System.Collections.Generic.List[string]]::new()
         foreach ($rn in @($stRestart.Keys)) {
-            Write-Host "  task $rn`: starting" -ForegroundColor DarkGray
-            Start-ScheduledTask -TaskPath '\' -TaskName $rn
+            if ([string]::IsNullOrEmpty($stDeferFile)) {
+                Write-Host "  task $rn`: starting" -ForegroundColor DarkGray
+                Start-ScheduledTask -TaskPath '\' -TaskName $rn
+            } else {
+                Write-Host "  task $rn`: disabled until the home scope is applied" -ForegroundColor DarkGray
+                $null = Disable-ScheduledTask -TaskPath '\' -TaskName $rn
+                Stop-NixWinTaskTree $rn
+                $stDeferred.Add([string]$rn)
+            }
+        }
+        if ($stDeferred.Count -gt 0) {
+            ConvertTo-Json -InputObject ([string[]]$stDeferred.ToArray()) |
+                Set-Content -LiteralPath $stDeferFile -Encoding utf8
         }
       '';
     };

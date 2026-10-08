@@ -1499,6 +1499,27 @@ function Invoke-HomeSwitch {
     Write-Status "`nnix-win: home switch to generation $($gen.Generation) complete." -ForegroundColor Green
 }
 
+# Enable and start the scheduled tasks a system activation held back (its
+# scheduledTasks step lists them in the file named by
+# NIX_WIN_DEFERRED_TASK_STARTS). They restart on a payload change, and the
+# payload may live in the home scope, so they start only once that is applied.
+# A task that will not start is a warning: the generation is already active.
+function Start-NixWinDeferredTasks {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $names = @(Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json)
+    foreach ($n in $names) {
+        Write-Status "  task $n`: starting" -ForegroundColor DarkGray
+        try {
+            $null = Enable-ScheduledTask -TaskPath '\' -TaskName $n -ErrorAction Stop
+            Start-ScheduledTask -TaskPath '\' -TaskName $n -ErrorAction Stop
+        } catch {
+            Write-Warning "nix-win: could not start scheduled task '$n': $($_.Exception.Message)"
+        }
+    }
+    Remove-Item -LiteralPath $Path -ErrorAction SilentlyContinue
+}
+
 # Activate a system generation. The ONE path `switch`, `rollback` and
 # `switch-generation` all take — darwin-rebuild's shape: the profile is
 # re-pointed first, then the generation it now names is activated.
@@ -1512,6 +1533,8 @@ function Invoke-HomeSwitch {
 #      Remove-StaleFiles)
 #   6. save state, root the generation, write the build-skip marker
 #   7. apply the embedded home scope the same way
+#   8. start the scheduled tasks activation held back for the home scope
+#      (Start-NixWinDeferredTasks), even when an earlier step threw
 function Invoke-Activate {
     param(
         [Parameter(Mandatory)][string]$StorePath,
@@ -1548,94 +1571,106 @@ function Invoke-Activate {
         Deploy-Links -WinStorePath $winPath -PrevLinks $prevLinks
     }
 
-    Write-Status "`nnix-win: running activation scripts..." -ForegroundColor Cyan
-    $env:NIX_WIN_STORE_PATH = $winPath
-    Set-OldStorePathEnv -OldStorePath $prevStorePath
-    # Where activation steps may drop per-generation artifacts (large tool
-    # output that belongs on disk rather than in the console log — see the
-    # dsc module, which parks its full result JSON here).
-    $env:NIX_WIN_GENERATION_DIR = $genDataDir
-    Publish-ChangedFiles -Scope "system"
-    $activateScript = Join-Path $winPath "activate.ps1"
-    if (Test-Path $activateScript) {
-        # Wrap the activation call so a throw doesn't silently skip Save-State
-        # with nothing but a small default PS error block. The failure mode
-        # we're guarding against: activate.ps1 invokes DSC/WinGet/PowerShell
-        # modules, any of which can throw.
-        try {
-            # Out-Host: this function's success stream must stay empty.
-            & $activateScript | Out-Host
-        } catch {
-            $err = $_
-            Write-Status ""
-            Write-Status "════════════════════════════════════════════════════════════════════" -ForegroundColor Red
-            Write-Status " nix-win: ACTIVATION FAILED" -ForegroundColor Red
-            Write-Status "════════════════════════════════════════════════════════════════════" -ForegroundColor Red
-            Write-Status ""
-            Write-Status "Generation $GenerationNumber was NOT activated." -ForegroundColor Red
-            Write-Status "The machine remains at generation $prevGeneration; the profile already names $GenerationNumber." -ForegroundColor Red
-            Write-Status "Fix the configuration and switch again, or 'nix-win rollback'." -ForegroundColor Red
-            Write-Status ""
-            if ($err.InvocationInfo -and $err.InvocationInfo.PositionMessage) {
-                Write-Status "Failed at:" -ForegroundColor Red
-                Write-Status $err.InvocationInfo.PositionMessage -ForegroundColor Yellow
+    # The scheduledTasks step lists the tasks it holds back for the home scope
+    # in this file; Start-NixWinDeferredTasks starts them at the end, whatever
+    # happens in between.
+    $null = New-Item -ItemType Directory -Force -Path $genDataDir
+    $deferredStarts = Join-Path $genDataDir "deferred-task-starts.json"
+    Remove-Item -LiteralPath $deferredStarts -ErrorAction SilentlyContinue
+    $env:NIX_WIN_DEFERRED_TASK_STARTS = $deferredStarts
+    try {
+        Write-Status "`nnix-win: running activation scripts..." -ForegroundColor Cyan
+        $env:NIX_WIN_STORE_PATH = $winPath
+        Set-OldStorePathEnv -OldStorePath $prevStorePath
+        # Where activation steps may drop per-generation artifacts (large tool
+        # output that belongs on disk rather than in the console log — see the
+        # dsc module, which parks its full result JSON here).
+        $env:NIX_WIN_GENERATION_DIR = $genDataDir
+        Publish-ChangedFiles -Scope "system"
+        $activateScript = Join-Path $winPath "activate.ps1"
+        if (Test-Path $activateScript) {
+            # Wrap the activation call so a throw doesn't silently skip Save-State
+            # with nothing but a small default PS error block. The failure mode
+            # we're guarding against: activate.ps1 invokes DSC/WinGet/PowerShell
+            # modules, any of which can throw.
+            try {
+                # Out-Host: this function's success stream must stay empty.
+                & $activateScript | Out-Host
+            } catch {
+                $err = $_
                 Write-Status ""
-            }
-            Write-Status "Error:" -ForegroundColor Red
-            Write-Status "  $($err.Exception.Message)" -ForegroundColor Yellow
-            if ($err.ScriptStackTrace) {
+                Write-Status "════════════════════════════════════════════════════════════════════" -ForegroundColor Red
+                Write-Status " nix-win: ACTIVATION FAILED" -ForegroundColor Red
+                Write-Status "════════════════════════════════════════════════════════════════════" -ForegroundColor Red
                 Write-Status ""
-                Write-Status "Stack trace:" -ForegroundColor Red
-                Write-Status $err.ScriptStackTrace -ForegroundColor DarkGray
+                Write-Status "Generation $GenerationNumber was NOT activated." -ForegroundColor Red
+                Write-Status "The machine remains at generation $prevGeneration; the profile already names $GenerationNumber." -ForegroundColor Red
+                Write-Status "Fix the configuration and switch again, or 'nix-win rollback'." -ForegroundColor Red
+                Write-Status ""
+                if ($err.InvocationInfo -and $err.InvocationInfo.PositionMessage) {
+                    Write-Status "Failed at:" -ForegroundColor Red
+                    Write-Status $err.InvocationInfo.PositionMessage -ForegroundColor Yellow
+                    Write-Status ""
+                }
+                Write-Status "Error:" -ForegroundColor Red
+                Write-Status "  $($err.Exception.Message)" -ForegroundColor Yellow
+                if ($err.ScriptStackTrace) {
+                    Write-Status ""
+                    Write-Status "Stack trace:" -ForegroundColor Red
+                    Write-Status $err.ScriptStackTrace -ForegroundColor DarkGray
+                }
+                Write-Status ""
+                Write-Status "════════════════════════════════════════════════════════════════════" -ForegroundColor Red
+                # Re-throw so the overall script exits non-zero and any wrapping
+                # script (CI, scheduled task) sees the failure.
+                throw
             }
-            Write-Status ""
-            Write-Status "════════════════════════════════════════════════════════════════════" -ForegroundColor Red
-            # Re-throw so the overall script exits non-zero and any wrapping
-            # script (CI, scheduled task) sees the failure.
-            throw
         }
-    }
 
-    # Only reached on successful activation.
-    Write-Status "`nnix-win: removing files that left the configuration..." -ForegroundColor Cyan
-    $carry = Remove-StaleFiles -PrevFiles $prevFiles -NewFiles $newFiles -ProtectedFiles $homePrevFiles
-    foreach ($k in $carry.Keys) { $newFiles[$k] = $carry[$k] }
+        # Only reached on successful activation.
+        Write-Status "`nnix-win: removing files that left the configuration..." -ForegroundColor Cyan
+        $carry = Remove-StaleFiles -PrevFiles $prevFiles -NewFiles $newFiles -ProtectedFiles $homePrevFiles
+        foreach ($k in $carry.Keys) { $newFiles[$k] = $carry[$k] }
 
-    Save-State @{
-        currentGeneration = $GenerationNumber
-        storePath         = $StorePath
-        activatedAt       = (Get-Date -Format "o")
-        files             = $newFiles
-        links             = $newLinks
-    }
-    Complete-SystemGeneration -StorePath $StorePath
-
-    # Embedded per-user scope: apply the current user's home activation
-    # package if the toplevel carries one (home-manager integration). Runs
-    # AFTER the system phases so scoop/winget-installed tools are on PATH
-    # for user activation. Other users' packages are skipped — their
-    # profiles belong to them; they run `nix-win switch -Home` themselves.
-    $userName = $env:USERNAME.ToLower()
-    $userDir = Join-Path (Join-Path $winPath "users") $userName
-    if (Test-Path -LiteralPath $userDir) {
-        Write-Status "`nnix-win: applying embedded home scope for $env:USERNAME..." -ForegroundColor Cyan
-        $homeStorePath = "$StorePath/users/$userName"
-
-        $homeResult = Invoke-HomeApply -HomeWinPath $userDir -StatePath $homeStateFile `
-            -PrevFiles $homePrevFiles -PrevLinks $homePrevLinks `
-            -BackupDir (Join-Path $genDataDir "home-backups") `
-            -SourceUnchanged:((Get-StateValue $homeState 'storePath' '') -eq $homeStorePath -and $homePrevFiles.Count -gt 0) `
-            -ProtectedFiles $newFiles
-
-        # The embedded home scope has no generations of its own; it carries
-        # the system generation's number.
-        Save-State -Path $homeStateFile -State @{
+        Save-State @{
             currentGeneration = $GenerationNumber
-            storePath         = $homeStorePath
+            storePath         = $StorePath
             activatedAt       = (Get-Date -Format "o")
-            files             = $homeResult.files
-            links             = $homeResult.links
+            files             = $newFiles
+            links             = $newLinks
         }
+        Complete-SystemGeneration -StorePath $StorePath
+
+        # Embedded per-user scope: apply the current user's home activation
+        # package if the toplevel carries one (home-manager integration). Runs
+        # AFTER the system phases so scoop/winget-installed tools are on PATH
+        # for user activation. Other users' packages are skipped — their
+        # profiles belong to them; they run `nix-win switch -Home` themselves.
+        $userName = $env:USERNAME.ToLower()
+        $userDir = Join-Path (Join-Path $winPath "users") $userName
+        if (Test-Path -LiteralPath $userDir) {
+            Write-Status "`nnix-win: applying embedded home scope for $env:USERNAME..." -ForegroundColor Cyan
+            $homeStorePath = "$StorePath/users/$userName"
+
+            $homeResult = Invoke-HomeApply -HomeWinPath $userDir -StatePath $homeStateFile `
+                -PrevFiles $homePrevFiles -PrevLinks $homePrevLinks `
+                -BackupDir (Join-Path $genDataDir "home-backups") `
+                -SourceUnchanged:((Get-StateValue $homeState 'storePath' '') -eq $homeStorePath -and $homePrevFiles.Count -gt 0) `
+                -ProtectedFiles $newFiles
+
+            # The embedded home scope has no generations of its own; it carries
+            # the system generation's number.
+            Save-State -Path $homeStateFile -State @{
+                currentGeneration = $GenerationNumber
+                storePath         = $homeStorePath
+                activatedAt       = (Get-Date -Format "o")
+                files             = $homeResult.files
+                links             = $homeResult.links
+            }
+        }
+    } finally {
+        Remove-Item Env:NIX_WIN_DEFERRED_TASK_STARTS -ErrorAction SilentlyContinue
+        Start-NixWinDeferredTasks -Path $deferredStarts
     }
 }
 
