@@ -15,6 +15,31 @@ home-manager-compatible per-user layer. Two module classes:
   (`lib/hm/stdlib-extended.nix`, mirroring home-manager). Implements
   home-manager's option shapes exactly (see the HM-compat contract below).
 
+## nix-win is an upstream project: nothing about any consumer
+
+nix-win is a public, general-purpose project. It does not know who uses it, and
+nothing in it may say. That covers every commit message, comment, doc, test,
+fixture and example, and the reasoning in an agent's own commit text:
+
+- **No consumer's machines**: no hostnames, usernames, home paths, drive
+  layouts or measurements "on <host>".
+- **No consumer's repositories**: no configuration repo, flake, checkout path
+  or commit hash of anything that consumes nix-win.
+- **No consumer's software**: no package, tool, service, script or option
+  name from a consuming configuration, and no account of what broke there.
+
+Say what nix-win does and why in nix-win's own terms. A bug found through a
+consumer is described by the nix-win behavior that was wrong ("a failed
+warm-up reported success"), never by the consumer's symptom ("every hook on
+<host> died"). Measurements and verification are stated generically ("on a
+real Windows host", "against a consuming flake"). Fixtures and examples use
+neutral names (`alice`, `check-tool`, `example.com`).
+
+A change you were asked to make *for* a consumer is still written as if no
+consumer existed. Before every commit, read the full message and the staged
+diff once for anything that names a specific person's machine, repository
+or software, and rewrite it before committing.
+
 ## Architecture
 
 ```
