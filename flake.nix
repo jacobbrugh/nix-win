@@ -99,6 +99,10 @@
           # Regenerate all generated DSC modules in one shot.
           # After running: cp -r result/* modules/dsc/generated/
           generate-dsc-modules = gens.generateAll;
+
+          # The scheduledTasks.<name>.hideConsole launcher, for
+          # tests/run-hidden-live.ps1 on a Windows host.
+          run-hidden = pkgs.callPackage ./pkgs/run-hidden/package.nix { };
         }
       );
 
@@ -390,6 +394,13 @@
                   command = "powershell.exe";
                   runAtLogon = true;
                 };
+                scheduledTasks."Hidden Task" = {
+                  command = "powershell.exe";
+                  arguments = "-NoProfile -File C:\\check.ps1";
+                  hideConsole = true;
+                  runAtLogon = true;
+                  restartTriggers = [ "check-payload" ];
+                };
                 networking.firewall.allowedTCPPorts = [ 22 ];
                 networking.hosts."192.0.2.1" = [ "check.example" ];
                 system.convergeScripts."Check Converge" = {
@@ -538,6 +549,17 @@
 
                 # What a generation records about what it declared.
                 grep -q '"name":"Check Task"' "$full/scheduled-tasks/tasks.json"
+                # hideConsole: the launcher is recorded beside the declared
+                # command (which stays as declared), and it is staged.
+                grep -q '"hideConsoleLauncher":"nix-win/Programs/run-hidden/bin/run-hidden.exe"' "$full/scheduled-tasks/tasks.json"
+                grep -q '"hideConsoleLauncher":null' "$full/scheduled-tasks/tasks.json"
+                grep -q '"command":"powershell.exe"' "$full/scheduled-tasks/tasks.json"
+                [ -s "$full/programdata/nix-win/Programs/run-hidden/bin/run-hidden.exe" ]
+                # ...and only when a task asks for it.
+                if [ -e "$bare/programdata/nix-win/Programs/run-hidden" ]; then
+                  echo "launcher staged with no hideConsole task" >&2; exit 1
+                fi
+                grep -q 'function Get-NixWinTaskAction' "$full/activate.ps1"
                 grep -q '"name":"nix-win-allow-tcp-22"' "$full/firewall/rules.json"
                 grep -q '"name":"check.example"' "$full/networking/hosts.json"
                 grep -q '"name":"Check Converge"' "$full/converge-scripts/scripts.json"

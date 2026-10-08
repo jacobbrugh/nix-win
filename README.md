@@ -165,7 +165,7 @@ A complete minimal example lives at
 | `programs.openssh` | OpenSSH server configuration |
 | `networking.hosts` | Hosts-file entries (NixOS shape: IP → hostnames), converged natively |
 | `networking.firewall.{allowedTCPPorts, allowedUDPPorts, rules}` | Native firewall rule convergence |
-| `scheduledTasks` | Task Scheduler entries, converged natively; `executionTimeLimit` (`"PT0S"` for a long-running task), `runAtUnlock`, and systemd-style `restartTriggers` that kill the running tree and restart the task when they change |
+| `scheduledTasks` | Task Scheduler entries, converged natively; `executionTimeLimit` (`"PT0S"` for a long-running task), `runAtUnlock`, systemd-style `restartTriggers` that kill the running tree and restart the task when they change, and `hideConsole`, which runs a console command through a launcher with no window, inside a job that a task stop kills whole, passing the command's exit code through |
 | `system.convergeScripts.<name>` | Ordered test/set convergence steps (`{ priority; testScript; setScript; }`) |
 | `services.<name>` | Assertions on the state/startupType of *existing* SCM services (free-form entries; other modules may declare their own options under `services`) |
 | `dsc.*` | PowerShell DSC v3 — see below |

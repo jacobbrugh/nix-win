@@ -162,6 +162,9 @@ pwsh -NoProfile -File tests/cli-functions.ps1
 pwsh -NoProfile -File tests/registry-live.ps1
 # needs the WSL distro; scratch $HOME, never the real stage:
 pwsh -NoProfile -File tests/stage-markers-live.ps1
+# the hideConsole launcher (copy result/bin/run-hidden.exe from
+# `nix build .#run-hidden` to the Windows side first):
+pwsh -NoProfile -File tests/run-hidden-live.ps1 -Launcher <path>\run-hidden.exe
 ```
 
 ## Directory Structure
@@ -213,9 +216,12 @@ pkgs/
                              #   list-generations/gc, -Home for the per-user scope
   staged-uv-tree/            # builds home.stagedUvTools' Windows runtime tree
                              #   (typed Python; mypy --strict + pytest at build)
+  run-hidden/                # scheduledTasks.<name>.hideConsole's launcher (one C
+                             #   file, MinGW cross-compiled, GUI subsystem)
 tests/                       # PowerShell tests: parse.ps1, removal-logic.ps1 and
                              #   registry-plan.ps1 run in flake checks;
-                             #   cli-functions.ps1 and registry-live.ps1 on Windows
+                             #   cli-functions.ps1, registry-live.ps1 and
+                             #   run-hidden-live.ps1 on Windows
   generators/                # dsc2nix.py + pinned schema sources; regenerate with
                              #   nix build .#generate-dsc-modules && cp -rL result/* modules/dsc/generated/
 ```

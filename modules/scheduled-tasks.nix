@@ -32,6 +32,12 @@ let
 
   enabled = lib.filterAttrs (_: t: t.enable) cfg;
 
+  # The launcher behind `hideConsole`, staged by environment.systemPackages
+  # under %ProgramData% at this relative path.
+  runHidden = pkgs.callPackage ../pkgs/run-hidden/package.nix { };
+  runHiddenRelPath = "${runHidden.passthru.nixWin.relativePath}/bin/run-hidden.exe";
+  anyHidden = lib.any (t: t.hideConsole) (lib.attrValues enabled);
+
   # A fixed past instant for interval triggers. Task Scheduler models "every N
   # seconds forever" as a one-shot trigger with a repetition attached, so it
   # needs a start boundary; any past timestamp behaves identically.
@@ -53,13 +59,21 @@ let
           executionTimeLimit
           ;
         startCalendar = t.startCalendar;
+        # Where the launcher lives under %ProgramData%, or null. A separate
+        # field rather than a rewritten command/arguments: an older
+        # generation's activation reads this artifact after a rollback and
+        # must still find the declared command there.
+        hideConsoleLauncher = if t.hideConsole then runHiddenRelPath else null;
         # A digest, not the strings: the artifact only has to tell the next
-        # generation whether they changed.
+        # generation whether they changed. A task that restarts on its payload
+        # also restarts on a new launcher, which it runs inside.
         restartStamp =
           if t.restartTriggers == [ ] then
             null
           else
-            builtins.hashString "sha256" (lib.concatStringsSep "\n" t.restartTriggers);
+            builtins.hashString "sha256" (
+              lib.concatStringsSep "\n" (t.restartTriggers ++ lib.optional t.hideConsole "${runHidden}")
+            );
         principal = {
           inherit (t.principal)
             userName
@@ -120,6 +134,27 @@ in
               description = "Working directory for the action.";
             };
 
+            hideConsole = lib.mkOption {
+              type = lib.types.bool;
+              default = false;
+              description = ''
+                Run a console `command` without a console window. Task
+                Scheduler can only start an executable, and a console program
+                started that way gets a window before its own code runs, so a
+                flag such as `-WindowStyle Hidden` can only hide a window that
+                has already appeared.
+
+                When set, the action runs a small GUI-subsystem launcher
+                (staged under `%ProgramData%\nix-win\Programs\run-hidden`) that
+                starts `command` with `arguments` using CREATE_NO_WINDOW,
+                inside a job object, and exits with the command's exit code, so
+                the task's last result is the command's. Stopping the task, or
+                its `executionTimeLimit` running out, ends the launcher and
+                with it the whole process tree. When the command exits on its
+                own, whatever it deliberately left running keeps running.
+              '';
+            };
+
             runAtLogon = lib.mkOption {
               type = lib.types.bool;
               default = false;
@@ -136,10 +171,9 @@ in
                 one schedule trigger, not instead of it.
 
                 This is the second chance a GUI process needs when its logon
-                launch lands in a locked session — a session locked at logon
-                has no foreground window to hand over, so a program that
-                insists on one (komorebi's AllowSetForegroundWindow check)
-                exits, and nothing else would start it again.
+                launch lands in a session that locks at once: a program that
+                needs to take the foreground can fail to start there, and
+                nothing else would start it again.
               '';
             };
 
@@ -152,12 +186,11 @@ in
                 as an ISO 8601 duration. `null` keeps Windows' default of 72
                 hours; `"PT0S"` means no limit.
 
-                A long-running task wants `"PT0S"`: the stop kills only the
-                process the task launched, so a child tree (the pwsh under a
-                `conhost --headless` action, say) survives it, the instance
-                counts as finished, and the next trigger starts a second copy
-                beside the first. An on-demand start (Start-ScheduledTask) is
-                never limited.
+                A long-running task wants `"PT0S"`, or it is stopped after 72
+                hours. That stop ends only the process the task launched, so
+                without `hideConsole` a child tree under that process survives
+                it while the instance counts as finished. An on-demand start
+                (Start-ScheduledTask) is never limited.
               '';
             };
 
@@ -175,8 +208,9 @@ in
 
                 Without it, a long-running task keeps its old payload until it
                 next exits: an unchanged registration leaves a running instance
-                alone, and stopping a task leaves the children of its action
-                process running.
+                alone. The restart kills the tree itself rather than relying on
+                a task stop, which ends only the action process unless the
+                task sets `hideConsole`.
               '';
             };
 
@@ -345,6 +379,8 @@ in
 
     system.build.scheduledTasks = tasksJson;
 
+    environment.systemPackages = lib.mkIf anyHidden [ runHidden ];
+
     system.activationScripts.scheduledTasks = {
       deps = [ "files" ];
       text = ''
@@ -423,6 +459,25 @@ in
             }
         }
 
+        # The action a declared task registers: its command and arguments, or
+        # for a hideConsole task the launcher with the command as its
+        # arguments. The command is quoted when it contains a space and is not
+        # quoted already, because the launcher passes its argument string on
+        # to CreateProcessW verbatim.
+        function Get-NixWinTaskAction($d) {
+            $hcProp = $d.PSObject.Properties['hideConsoleLauncher']
+            if ($null -eq $hcProp -or $null -eq $hcProp.Value) {
+                return @{ Execute = [string]$d.command; Arguments = [string]$d.arguments }
+            }
+            $cmd = [string]$d.command
+            if (-not $cmd.StartsWith('"') -and $cmd.Contains(' ')) { $cmd = '"' + $cmd + '"' }
+            $hcArgs = if ([string]::IsNullOrEmpty([string]$d.arguments)) { $cmd } else { "$cmd $($d.arguments)" }
+            return @{
+                Execute   = Join-Path $env:ProgramData (([string]$hcProp.Value) -replace '/', '\')
+                Arguments = $hcArgs
+            }
+        }
+
         # restartTriggers: which tasks' payload changed since the generation
         # being replaced. A previous generation without the stamp (older
         # nix-win) counts as changed; no previous generation at all counts as
@@ -470,8 +525,9 @@ in
                 # keep-alives.
                 if ($live.Actions.Count -lt 1) { return $false }
                 $a = $live.Actions[0]
-                if ("$($a.Execute)" -ne "$($d.command)") { return $false }
-                if ("$($a.Arguments)" -ne "$($d.arguments)") { return $false }
+                $want = Get-NixWinTaskAction $d
+                if ("$($a.Execute)" -ne $want.Execute) { return $false }
+                if ("$($a.Arguments)" -ne $want.Arguments) { return $false }
                 if ($null -ne $d.workingDirectory -and
                     "$($a.WorkingDirectory)" -ne "$($d.workingDirectory)") { return $false }
 
@@ -549,13 +605,11 @@ in
                 }
                 return $true
             } -Set {
-                $action = if ([string]::IsNullOrEmpty($d.arguments)) {
-                    New-ScheduledTaskAction -Execute $d.command
-                } elseif ($null -ne $d.workingDirectory) {
-                    New-ScheduledTaskAction -Execute $d.command -Argument $d.arguments -WorkingDirectory $d.workingDirectory
-                } else {
-                    New-ScheduledTaskAction -Execute $d.command -Argument $d.arguments
-                }
+                $want = Get-NixWinTaskAction $d
+                $actionArgs = @{ Execute = $want.Execute }
+                if (-not [string]::IsNullOrEmpty($want.Arguments)) { $actionArgs.Argument = $want.Arguments }
+                if ($null -ne $d.workingDirectory) { $actionArgs.WorkingDirectory = $d.workingDirectory }
+                $action = New-ScheduledTaskAction @actionArgs
 
                 if ($d.runAtLogon) {
                     $trigger = if ($null -ne $d.principal.userName) {
