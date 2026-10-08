@@ -1,16 +1,18 @@
 # home.stagedUvTools — run a Nix-built Python tool natively on Windows.
 #
-# A buildPythonApplication is a Linux derivation in the WSL store; Windows
-# processes (pwsh, cmd.exe, Git Bash, Task Scheduler actions) cannot exec a
-# /nix/store path. The portable shape is to stage the package's *source*
-# tree under the profile and drive its uv_entry.py shim through
-# `uv run --script`: uv provisions CPython and the shim's PEP 723
-# dependencies itself, so no Windows Python install is needed.
+# Windows processes (pwsh, cmd.exe, Git Bash, Task Scheduler actions) cannot
+# exec a /nix/store path, but the files a Python package installs are plain
+# Python. So the tool is staged from its Nix build: the `site-packages` of the
+# package and of every Python module in its runtime closure
+# (`requiredPythonModules` over its propagatedBuildInputs) are merged into
+# `stagingDir`, beside a generated `launch.py` that calls the package's
+# `meta.mainProgram` console-script entry point. What runs on Windows is
+# exactly what the package's checks ran against; uv only provides the
+# CPython, and no dependency list exists to keep in sync with the package.
+# The build fails on a native extension, which Windows CPython cannot load.
 #
 # One tool =
-#   * one or more package source trees staged as SIBLINGS under
-#     `stagingDir` (a shim that sys.path-inserts its parent directory can
-#     import a sibling package, e.g. an app plus its shared library);
+#   * the staged tree + launch.py under `stagingDir`;
 #   * optional launchers in ~/.local/bin — a `.ps1` for PowerShell and an
 #     extensionless bash-shebang file for Git Bash/MSYS. TWO launchers,
 #     because the shells resolve a bare name by incompatible rules and no
@@ -22,9 +24,9 @@
 #     invisible to bash and the shebang file is unrunnable by pwsh;
 #   * a durable HKCU PATH entry for ~/.local/bin when any launcher is
 #     emitted (home.sessionPath dedupes);
-#   * a warm-up activation step so uv's first cold run (CPython download +
-#     wheel resolution) happens at switch time, not inside a live
-#     invocation's timeout. Doubles as a deploy-time smoke test.
+#   * a warm-up activation step that runs the tool once at switch time, so
+#     uv's first CPython download never lands inside a live invocation's
+#     timeout. A failed warm-up fails the switch.
 #
 # Forward slashes in the shim path deliberately: they survive POSIX-style
 # shell escaping (backslashes are eaten), and pwsh, uv and Python accept
@@ -44,27 +46,31 @@ let
   cfg = config.home.stagedUvTools;
   enabled = lib.filterAttrs (_: t: t.enable) cfg;
 
-  # Apply a tool package's include/exclude filter, if any. `include` is an
-  # allow-list of paths relative to the source root (files or directories);
-  # `exclude` is a list of relative paths to drop. Filtering happens in a
-  # tiny staging derivation so the staged home.file directory source is
-  # exactly the filtered tree.
-  filteredSource =
-    pkgName: p:
-    if p.include == null && p.exclude == [ ] then
-      p.source
-    else if p.include != null then
-      pkgs.runCommand "staged-uv-${pkgName}-src" { } ''
-        mkdir -p $out
-        cd ${lib.escapeShellArg "${p.source}"}
-        cp -rL --no-preserve=mode --parents -t $out ${lib.escapeShellArgs p.include}
-      ''
-    else
-      pkgs.runCommand "staged-uv-${pkgName}-src" { } ''
-        cp -rL --no-preserve=mode ${lib.escapeShellArg "${p.source}"} $out
-        chmod -R u+w $out
-        rm -rf ${lib.concatMapStringsSep " " (e: "$out/${lib.escapeShellArg e}") p.exclude}
-      '';
+  stagedUvTree = pkgs.callPackage ../../pkgs/staged-uv-tree/package.nix { };
+
+  # The Windows runtime tree for one tool, built from the package and its
+  # Python closure as Nix built them.
+  toolTree =
+    name: t:
+    let
+      python = t.python;
+      closure = lib.filter (d: d ? pythonModule) (
+        python.pkgs.requiredPythonModules (t.package.propagatedBuildInputs or [ ])
+      );
+      sources = map (d: "${d}/${python.sitePackages}") ([ t.package ] ++ closure);
+      mainProgram =
+        t.package.meta.mainProgram
+          or (throw "home.stagedUvTools.${name}: package ${t.package.name} sets no meta.mainProgram");
+      requiresPython = ">=${python.pythonVersion},<${lib.versions.major python.version}.${
+        toString (lib.toInt (lib.versions.minor python.version) + 1)
+      }";
+    in
+    pkgs.runCommand "staged-uv-${name}" { nativeBuildInputs = [ stagedUvTree ]; } ''
+      staged-uv-tree --out $out \
+        --main-program ${lib.escapeShellArg mainProgram} \
+        --requires-python ${lib.escapeShellArg requiresPython} \
+        ${lib.escapeShellArgs sources}
+    '';
 
   toolModule =
     { name, config, ... }:
@@ -76,55 +82,30 @@ let
           description = "Whether to stage and wire this tool.";
         };
 
-        stagingDir = lib.mkOption {
-          type = lib.types.str;
-          default = ".local/share/${name}";
+        package = lib.mkOption {
+          type = lib.types.package;
           description = ''
-            Home-relative directory the package source trees are staged
-            under (one subdirectory per `packages` entry).
+            The Nix-built Python application to stage. Its `site-packages`,
+            plus that of every Python module in its runtime closure, is
+            staged; `meta.mainProgram` names the console script the
+            launcher runs.
           '';
         };
 
-        packages = lib.mkOption {
-          type = lib.types.attrsOf (
-            lib.types.submodule {
-              options = {
-                source = lib.mkOption {
-                  type = lib.types.path;
-                  description = ''
-                    Source tree of the Python package (the directory that
-                    contains the modules, e.g. "''${pkg.src}/src/<package>"),
-                    staged to `<stagingDir>/<attr name>/`.
-                  '';
-                };
-                include = lib.mkOption {
-                  type = lib.types.nullOr (lib.types.listOf lib.types.str);
-                  default = null;
-                  description = ''
-                    Allow-list of source-relative paths to stage; everything
-                    else is dropped. Mutually exclusive with `exclude`.
-                  '';
-                };
-                exclude = lib.mkOption {
-                  type = lib.types.listOf lib.types.str;
-                  default = [ ];
-                  description = "Source-relative paths to drop from the staging.";
-                };
-              };
-            }
-          );
-          description = "Package source trees staged as siblings under `stagingDir`.";
+        python = lib.mkOption {
+          type = lib.types.package;
+          default = pkgs.python312;
+          defaultText = lib.literalExpression "pkgs.python312";
+          description = ''
+            The interpreter the package was built against. Selects the
+            `site-packages` layout and the CPython version uv provides.
+          '';
         };
 
-        entryPackage = lib.mkOption {
+        stagingDir = lib.mkOption {
           type = lib.types.str;
-          default =
-            let
-              names = lib.attrNames config.packages;
-            in
-            if lib.length names == 1 then lib.head names else name;
-          defaultText = lib.literalExpression "the sole packages entry, else the tool name";
-          description = "The `packages` entry whose uv_entry.py is the tool's shim.";
+          default = ".local/share/${name}";
+          description = "Home-relative directory the tree and launch.py are staged under.";
         };
 
         launchers = lib.mkOption {
@@ -157,48 +138,49 @@ let
           type = lib.types.bool;
           default = true;
           description = ''
-            Warm uv's script environment during home activation (first cold
-            run downloads CPython and the shim's wheels) and smoke-test the
-            staged tool.
+            Run the staged tool once during home activation (the first cold
+            run downloads CPython). A failure fails the switch.
           '';
         };
 
         warmupArgs = lib.mkOption {
           type = lib.types.listOf lib.types.str;
           default = [ "--help" ];
-          description = "Arguments the warm-up invocation passes to the shim.";
+          description = "Arguments the warm-up invocation passes to the tool.";
+        };
+
+        tree = lib.mkOption {
+          type = lib.types.package;
+          readOnly = true;
+          description = "The built runtime tree staged at `stagingDir`.";
         };
 
         shimPath = lib.mkOption {
           type = lib.types.str;
           readOnly = true;
-          description = "Absolute forward-slash path of the staged uv_entry.py shim.";
+          description = "Absolute forward-slash path of the generated launch.py.";
         };
 
         command = lib.mkOption {
           type = lib.types.str;
           readOnly = true;
           description = ''
-            The full `uv run` invocation string for the staged shim (`-q` so
+            The full `uv run` invocation string for the staged tool (`-q` so
             uv's progress chatter cannot pollute a consumer's stderr).
           '';
         };
       };
 
       config = {
-        shimPath = "${homeDirectory}/${config.stagingDir}/${config.entryPackage}/uv_entry.py";
+        tree = toolTree name config;
+        shimPath = "${homeDirectory}/${config.stagingDir}/launch.py";
         command = "uv run -q --script ${config.shimPath}";
       };
     };
 
   homeDirectory = config.home.homeDirectory;
 
-  stagedFiles = lib.concatMapAttrs (
-    _: t:
-    lib.mapAttrs' (
-      pkgName: p: lib.nameValuePair "${t.stagingDir}/${pkgName}" { source = filteredSource pkgName p; }
-    ) t.packages
-  ) enabled;
+  stagedFiles = lib.mapAttrs' (_: t: lib.nameValuePair t.stagingDir { source = t.tree; }) enabled;
 
   launcherFiles = lib.concatMapAttrs (
     _: t:
@@ -238,6 +220,7 @@ let
   ) enabled;
 
   warmupTools = lib.filterAttrs (_: t: t.warmup) enabled;
+  warmupEntry = name: "stagedUvTools-${name}-warmup";
 in
 {
   options.home.stagedUvTools = lib.mkOption {
@@ -253,17 +236,30 @@ in
       "%USERPROFILE%\\.local\\bin"
     ];
 
-    home.activation = lib.mapAttrs' (
-      name: t:
-      lib.nameValuePair "stagedUvTools-${name}-warmup" (
-        lib.hm.dag.entryAfter [ "writeBoundary" ] ''
-          Write-Host "${name}: warming uv script environment..." -ForegroundColor Cyan
-          $stagedUvWarmup = & uv run -q --script "${t.shimPath}" ${lib.concatStringsSep " " t.warmupArgs} 2>&1
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning "${name}: uv warm-up exited $LASTEXITCODE : $stagedUvWarmup"
+    # Each warm-up records its failure and lets the rest run, so one switch
+    # reports every broken tool; the verdict then fails the activation.
+    home.activation =
+      lib.mapAttrs' (
+        name: t:
+        lib.nameValuePair (warmupEntry name) (
+          lib.hm.dag.entryAfter [ "writeBoundary" ] ''
+            if (-not (Test-Path variable:script:NixWinStagedUvFailures)) {
+              $script:NixWinStagedUvFailures = [System.Collections.Generic.List[string]]::new()
+            }
+            Write-Host "${name}: warming uv script environment..." -ForegroundColor Cyan
+            $stagedUvWarmup = & uv run -q --script "${t.shimPath}" ${lib.concatStringsSep " " t.warmupArgs} 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              $script:NixWinStagedUvFailures.Add("${name}: exited $LASTEXITCODE`n$($stagedUvWarmup | Out-String)")
+            }
+          ''
+        )
+      ) warmupTools
+      // lib.optionalAttrs (warmupTools != { }) {
+        stagedUvTools-verdict = lib.hm.dag.entryAfter (map warmupEntry (lib.attrNames warmupTools)) ''
+          if ((Test-Path variable:script:NixWinStagedUvFailures) -and $script:NixWinStagedUvFailures.Count -gt 0) {
+            throw "staged uv tool warm-up failed:`n$($script:NixWinStagedUvFailures -join "`n")"
           }
-        ''
-      )
-    ) warmupTools;
+        '';
+      };
   };
 }

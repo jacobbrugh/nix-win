@@ -155,15 +155,66 @@
             echo in-dir > $out/inner.txt
           '';
 
-          # A fake staged-uv package source: an entry shim plus modules the
-          # include/exclude filters select between.
-          uvToolSrc = pkgs.runCommand "uv-tool-src" { } ''
-            mkdir -p $out/eval
-            printf '# uv shim\n' > $out/uv_entry.py
-            echo core > $out/core.py
-            echo extra > $out/extra.py
-            echo secret > $out/eval/secret.py
+          # Real Python packages for home.stagedUvTools: a library, an app
+          # that imports it through a console script, and an app whose
+          # closure carries a native extension (markupsafe's _speedups).
+          py = pkgs.python312Packages;
+          fixtureSrc =
+            name: files:
+            pkgs.runCommand "${name}-src" { } (
+              ''
+                mkdir -p $out
+              ''
+              + lib.concatStrings (
+                lib.mapAttrsToList (path: text: ''
+                  mkdir -p "$out/$(dirname ${path})"
+                  cp ${pkgs.writeText (baseNameOf path) text} "$out/${path}"
+                '') files
+              )
+            );
+          fixturePyproject = name: scripts: ''
+            [project]
+            name = "${name}"
+            version = "0.1.0"
+            ${scripts}
+            [build-system]
+            requires = ["setuptools"]
+            build-backend = "setuptools.build_meta"
           '';
+          checkLib = py.buildPythonPackage {
+            pname = "check-lib";
+            version = "0.1.0";
+            pyproject = true;
+            build-system = [ py.setuptools ];
+            src = fixtureSrc "check-lib" {
+              "pyproject.toml" = fixturePyproject "check-lib" "";
+              "check_lib/__init__.py" = "def greet() -> str:\n    return 'staged-ok'\n";
+            };
+          };
+          mkCheckApp =
+            pname: deps:
+            py.buildPythonApplication {
+              inherit pname;
+              version = "0.1.0";
+              pyproject = true;
+              build-system = [ py.setuptools ];
+              dependencies = deps;
+              src = fixtureSrc pname {
+                "pyproject.toml" = fixturePyproject pname ''
+                  [project.scripts]
+                  ${pname} = "check_tool.cli:main"
+                '';
+                "check_tool/__init__.py" = "";
+                "check_tool/cli.py" =
+                  "import check_lib\n\ndef main() -> int:\n    print(check_lib.greet())\n    return 0\n";
+              };
+              meta.mainProgram = pname;
+            };
+          checkTool = mkCheckApp "check-tool" [ checkLib ];
+          nativeTool = mkCheckApp "native-tool" [
+            checkLib
+            py.markupsafe
+          ];
 
           # A representative minimal system: exercises the module list, the
           # file tree builder, the packages merge, the activation DAG, and
@@ -253,9 +304,9 @@
               };
             };
 
-          # home.stagedUvTools: staging (with both filter modes), launcher
-          # emission, PATH entry, warm-up wiring, and the published
-          # read-only shimPath.
+          # home.stagedUvTools: the package's closure staged from its Nix
+          # build, the generated launcher, launchers, PATH entry, warm-up
+          # wiring and verdict, and the published read-only shimPath.
           stagedUv = self.lib.winHomeConfiguration {
             inherit pkgs;
             modules = [
@@ -263,25 +314,28 @@
                 home.username = "alice";
                 home.stateVersion = "0.2";
                 home.stagedUvTools.check-tool = {
-                  packages.check_tool = {
-                    source = uvToolSrc;
-                    exclude = [ "eval" ];
-                  };
+                  package = checkTool;
                   launchers = [
                     "ps1"
                     "bash"
                   ];
                 };
-                home.stagedUvTools.pick-tool = {
-                  packages.pick_tool = {
-                    source = uvToolSrc;
-                    include = [
-                      "uv_entry.py"
-                      "core.py"
-                    ];
-                  };
+                home.stagedUvTools.quiet-tool = {
+                  package = checkTool;
                   warmup = false;
                 };
+              }
+            ];
+          };
+
+          # A closure carrying a native extension cannot be staged.
+          stagedUvNative = self.lib.winHomeConfiguration {
+            inherit pkgs;
+            modules = [
+              {
+                home.username = "alice";
+                home.stateVersion = "0.2";
+                home.stagedUvTools.native-tool.package = nativeTool;
               }
             ];
           };
@@ -518,6 +572,7 @@
             "${minimal.config.system.build.toplevel}/activate.ps1"
             "${homeMinimal.activationPackage}/activate.ps1"
             "${homeBare.activationPackage}/activate.ps1"
+            "${stagedUv.activationPackage}/activate.ps1"
             "${./pkgs/nix-win/nix-win.ps1}"
             "${./lib/removal-prelude.ps1}"
             "${./lib/registry-baseline.ps1}"
@@ -619,20 +674,17 @@
               ''
                 set -eu
                 # Published read-only values
-                [ "$shimPath" = "C:/Users/alice/.local/share/check-tool/check_tool/uv_entry.py" ]
+                [ "$shimPath" = "C:/Users/alice/.local/share/check-tool/launch.py" ]
                 [ "$command" = "uv run -q --script $shimPath" ]
 
-                # exclude filter: eval/ dropped, everything else staged
-                [ -f "$ap/home/.local/share/check-tool/check_tool/uv_entry.py" ]
-                [ -f "$ap/home/.local/share/check-tool/check_tool/core.py" ]
-                [ -f "$ap/home/.local/share/check-tool/check_tool/extra.py" ]
-                [ ! -e "$ap/home/.local/share/check-tool/check_tool/eval" ]
-
-                # include filter: only the allow-list staged
-                [ -f "$ap/home/.local/share/pick-tool/pick_tool/uv_entry.py" ]
-                [ -f "$ap/home/.local/share/pick-tool/pick_tool/core.py" ]
-                [ ! -e "$ap/home/.local/share/pick-tool/pick_tool/extra.py" ]
-                [ ! -e "$ap/home/.local/share/pick-tool/pick_tool/eval" ]
+                # The app and its dependency, from their Nix builds, beside
+                # the generated launcher; uv resolves nothing.
+                tree="$ap/home/.local/share/check-tool"
+                [ -f "$tree/check_tool/cli.py" ]
+                [ -f "$tree/check_lib/__init__.py" ]
+                grep -q '# dependencies = \[\]' "$tree/launch.py"
+                grep -q "import_module('check_tool.cli')" "$tree/launch.py"
+                [ "$(${pkgs.python312}/bin/python3 -I "$tree/launch.py")" = "staged-ok" ]
 
                 # Launchers: .ps1 is CRLF and targets the shim; the bash
                 # launcher is LF with the shebang in the first bytes
@@ -650,14 +702,28 @@
                 # PATH entry emitted once for the launcher dir
                 grep -Fq '%USERPROFILE%' "$ap/environment/user-path.json"
 
-                # Warm-up present for check-tool, absent for pick-tool
+                # Warm-up present for check-tool, absent for quiet-tool, and
+                # a failed warm-up fails the activation.
                 grep -q 'check-tool: warming uv script environment' "$ap/activate.ps1"
-                if grep -q 'pick-tool: warming' "$ap/activate.ps1"; then
-                  echo "pick-tool warmup should be disabled" >&2; exit 1
+                if grep -q 'quiet-tool: warming' "$ap/activate.ps1"; then
+                  echo "quiet-tool warmup should be disabled" >&2; exit 1
                 fi
+                grep -q 'throw "staged uv tool warm-up failed' "$ap/activate.ps1"
 
                 touch $out
               '';
+
+          staged-uv-native-fails =
+            let
+              failed = pkgs.testers.testBuildFailure stagedUvNative.config.home.stagedUvTools.native-tool.tree;
+            in
+            pkgs.runCommand "nix-win-staged-uv-native-fails" { } ''
+              grep -q 'native extensions cannot run on Windows CPython' ${failed}/testBuildFailure.log
+              grep -q 'markupsafe/_speedups' ${failed}/testBuildFailure.log
+              touch $out
+            '';
+
+          staged-uv-tree = pkgs.callPackage ./pkgs/staged-uv-tree/package.nix { };
         }
       );
     };

@@ -186,6 +186,8 @@ modules/
 pkgs/
   nix-win/nix-win.ps1        # CLI: build/switch/rollback/switch-generation/
                              #   list-generations/gc, -Home for the per-user scope
+  staged-uv-tree/            # builds home.stagedUvTools' Windows runtime tree
+                             #   (typed Python; mypy --strict + pytest at build)
 tests/                       # PowerShell tests: parse.ps1, removal-logic.ps1 and
                              #   registry-plan.ps1 run in flake checks;
                              #   cli-functions.ps1 and registry-live.ps1 on Windows
