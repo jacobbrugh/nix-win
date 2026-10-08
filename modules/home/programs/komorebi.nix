@@ -114,14 +114,22 @@ in
       example = "Start Komorebi";
       description = ''
         Name of a scheduled task that launches komorebi. When set, activation
-        performs a full `komorebic stop --bar` plus Start-ScheduledTask
-        instead of `komorebic reload-configuration`.
+        relaunches komorebi after a change to its config files: a full
+        `komorebic stop --bar`, then Start-ScheduledTask. When null,
+        activation runs no komorebic command at all.
 
-        Required for any change to `display_index_preferences`,
-        `monitor_index_preferences`, `monitors` or `bar_configurations`:
-        reload-configuration re-reads komorebi.json but does not re-enumerate
-        monitors, rebuild the workspace topology, or relaunch komorebi-bar,
-        so those keys silently take no effect until the daemon restarts.
+        komorebi watches the static config file it loaded and reloads it on
+        every change, and komorebi-bar does the same for its own config file,
+        so most edits apply without any command. A reload applies settings to
+        the monitors komorebi already has and never starts, stops or
+        re-targets bars, so `display_index_preferences`,
+        `monitor_index_preferences`, `monitors` and `bar_configurations`
+        changes need a relaunch. `komorebic reload-configuration` is not that
+        reload: it re-runs legacy komorebi.ahk / komorebi.ps1 configurations
+        only.
+
+        Leave this null when something else owns komorebi's lifetime and
+        restarts it on config changes itself.
 
         Start-ScheduledTask rather than Start-Process so a switch run from a
         non-interactive context (SSH, session 0) cannot strand the
@@ -145,14 +153,15 @@ in
         home.sessionVariables.KOMOREBI_CONFIG_HOME = lib.replaceStrings [ "/" ] [ "\\" ] (
           "${config.home.homeDirectory}/${cfg.configHome}"
         );
+      }
 
-        # The daemon re-reads komorebi.json from its resolved config path;
-        # komorebi-bar hot-watches komorebi.bar.json on its own. A daemon
-        # started before KOMOREBI_CONFIG_HOME existed keeps resolving the
-        # old fallback path until it is relaunched (e.g. via its AtLogon
-        # task); reload alone cannot repoint it. The same is true of
-        # monitor/workspace/bar topology — hence relaunchTask.
-        home.activation.reloadKomorebi =
+      # komorebi reloads the static config file it loaded on every change, and
+      # komorebi-bar its own config file, so a plain edit needs no command.
+      # Monitor/workspace/bar topology does not apply until the daemon
+      # restarts, and a daemon started before KOMOREBI_CONFIG_HOME existed
+      # keeps resolving the old fallback path until then — hence relaunchTask.
+      (lib.mkIf (cfg.relaunchTask != null) {
+        home.activation.relaunchKomorebi =
           let
             # Exactly the files this module deploys into configHome, taken from
             # the declarations themselves so the gate below cannot drift from
@@ -165,11 +174,9 @@ in
             ) managed;
           in
           lib.hm.dag.entryAfter [ "writeBoundary" ] ''
-            # Reload/restart only when one of the deployed config files actually
-            # changed. This ran unconditionally, so every switch tore the window
-            # manager down — with relaunchTask set that is `komorebic stop --bar`
-            # plus a 2 s sleep plus a task start — to re-read byte-identical
-            # files.
+            # Relaunch only when one of the deployed config files actually
+            # changed, rather than tearing the window manager down on every
+            # switch to re-read byte-identical files.
             #
             # An `if`, not an early `return`: activation entries are concatenated
             # into one script, so a top-level `return` would abandon every entry
@@ -178,36 +185,23 @@ in
             if ($komorebiFiles.Count -gt 0 -and -not (Test-NixWinFileChanged -Path $komorebiFiles)) {
                 Write-Host "nix-win: Komorebi config unchanged, left alone." -ForegroundColor DarkGray
             } elseif (-not (Get-Command komorebic -ErrorAction SilentlyContinue)) {
-                Write-Host "nix-win: komorebic not found, skipping Komorebi reload." -ForegroundColor DarkYellow
+                Write-Host "nix-win: komorebic not found, skipping Komorebi relaunch." -ForegroundColor DarkYellow
             } else {
-              ${
-                if cfg.relaunchTask != null then
-                  ''
-                    Write-Host "nix-win: restarting Komorebi..." -ForegroundColor Cyan
-                    # Keep komorebic's output instead of discarding it, but gate
-                    # on the exit code rather than on the text being non-empty:
-                    # `komorebic stop --bar` writes a bare "Error:" header to
-                    # stderr and still exits 0, so the non-empty test reported a
-                    # scary failure on every single restart.
-                    $komoOut = (komorebic stop --bar 2>&1 | Out-String).Trim()
-                    if ($LASTEXITCODE -ne 0) {
-                        Write-Host "  komorebic stop --bar failed (exit $LASTEXITCODE): $komoOut" -ForegroundColor Yellow
-                    }
-                    Start-Sleep -Seconds 2
-                    Start-ScheduledTask -TaskName "${cfg.relaunchTask}" -ErrorAction Stop
-                  ''
-                else
-                  ''
-                    Write-Host "nix-win: reloading Komorebi..." -ForegroundColor Cyan
-                    $komoOut = (komorebic reload-configuration 2>&1 | Out-String).Trim()
-                    if ($LASTEXITCODE -ne 0) {
-                        Write-Host "  komorebic reload-configuration failed (exit $LASTEXITCODE): $komoOut" -ForegroundColor Yellow
-                    }
-                  ''
-              }
+                Write-Host "nix-win: restarting Komorebi..." -ForegroundColor Cyan
+                # Keep komorebic's output instead of discarding it, but gate
+                # on the exit code rather than on the text being non-empty:
+                # `komorebic stop --bar` writes a bare "Error:" header to
+                # stderr and still exits 0, so the non-empty test reported a
+                # scary failure on every single restart.
+                $komoOut = (komorebic stop --bar 2>&1 | Out-String).Trim()
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host "  komorebic stop --bar failed (exit $LASTEXITCODE): $komoOut" -ForegroundColor Yellow
+                }
+                Start-Sleep -Seconds 2
+                Start-ScheduledTask -TaskName "${cfg.relaunchTask}" -ErrorAction Stop
             }
           '';
-      }
+      })
     ]
   );
 }
