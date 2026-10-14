@@ -400,6 +400,7 @@
                   hideConsole = true;
                   runAtLogon = true;
                   restartTriggers = [ "check-payload" ];
+                  executionTimeLimit = "PT1H";
                 };
                 # Every schedule trigger kind but the daily one, together.
                 scheduledTasks."Watchdog Task" = {
@@ -596,6 +597,11 @@
                   echo "launcher staged with no hideConsole task" >&2; exit 1
                 fi
                 grep -q 'function Get-NixWinTaskAction' "$full/activate.ps1"
+                # A task never times out unless it says so.
+                jq -e '.[] | select(.name == "Check Task") | .executionTimeLimit == "PT0S"' \
+                  "$full/scheduled-tasks/tasks.json" > /dev/null
+                jq -e '.[] | select(.name == "Hidden Task") | .executionTimeLimit == "PT1H"' \
+                  "$full/scheduled-tasks/tasks.json" > /dev/null
                 # Schedule triggers combine.
                 jq -e '.[] | select(.name == "Watchdog Task")
                   | .runAtLogon == true and .startInterval == 60 and .runAtUnlock == true' \

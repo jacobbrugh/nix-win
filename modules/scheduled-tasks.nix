@@ -149,7 +149,7 @@ in
                 starts `command` with `arguments` using CREATE_NO_WINDOW,
                 inside a job object, and exits with the command's exit code, so
                 the task's last result is the command's. Stopping the task, or
-                its `executionTimeLimit` running out, ends the launcher and
+                a finite `executionTimeLimit` running out, ends the launcher and
                 with it the whole process tree; activation stops such a task the
                 same way. When the command exits on its own, whatever it
                 deliberately left running keeps running.
@@ -187,19 +187,19 @@ in
             };
 
             executionTimeLimit = lib.mkOption {
-              type = lib.types.nullOr lib.types.str;
-              default = null;
-              example = "PT0S";
+              type = lib.types.str;
+              default = "PT0S";
+              example = "PT1H";
               description = ''
                 How long an instance may run before Task Scheduler stops it,
-                as an ISO 8601 duration. `null` keeps Windows' default of 72
-                hours; `"PT0S"` means no limit.
+                as an ISO 8601 duration. The default, `"PT0S"`, is no limit: a
+                task runs until it exits or is stopped. nix-win always writes
+                this setting, so Windows' own default (stop after 72 hours)
+                never applies.
 
-                A long-running task wants `"PT0S"`, or it is stopped after 72
-                hours. That stop ends only the process the task launched, so
-                without `hideConsole` a child tree under that process survives
-                it while the instance counts as finished. An on-demand start
-                (Start-ScheduledTask) is never limited.
+                When a duration runs out, the stop ends only the process the
+                task launched; without `hideConsole` a child tree under that
+                process survives it while the instance counts as finished.
               '';
             };
 
@@ -375,14 +375,13 @@ in
         }
         {
           assertion =
-            t.executionTimeLimit == null
-            || builtins.match "P([0-9]+D)?(T([0-9]+H)?([0-9]+M)?([0-9]+S)?)?" t.executionTimeLimit != null
-              && !(builtins.elem t.executionTimeLimit [
-                "P"
-                "PT"
-              ]);
+            builtins.match "P([0-9]+D)?(T([0-9]+H)?([0-9]+M)?([0-9]+S)?)?" t.executionTimeLimit != null
+            && !(builtins.elem t.executionTimeLimit [
+              "P"
+              "PT"
+            ]);
           message =
-            "scheduledTasks.\"${name}\": executionTimeLimit \"${toString t.executionTimeLimit}\" is not "
+            "scheduledTasks.\"${name}\": executionTimeLimit \"${t.executionTimeLimit}\" is not "
             + "an ISO 8601 duration of days, hours, minutes and seconds (e.g. \"PT0S\", \"PT72H\").";
         }
         {
@@ -609,13 +608,13 @@ in
                 # left disabled by an interrupted switch is re-registered here.
                 if ($live.Settings.Enabled -ne $true) { return $false }
                 # Parsed, not string-compared: PT72H and P3D are the same limit.
-                if ($null -ne $d.executionTimeLimit) {
-                    try {
-                        $wantLimit = [System.Xml.XmlConvert]::ToTimeSpan("$($d.executionTimeLimit)")
-                        $gotLimit = [System.Xml.XmlConvert]::ToTimeSpan("$($live.Settings.ExecutionTimeLimit)")
-                    } catch { return $false }
-                    if ($gotLimit -ne $wantLimit) { return $false }
-                }
+                # Always declared (default PT0S), so a task registered under
+                # Windows' 72-hour default never converges.
+                try {
+                    $wantLimit = [System.Xml.XmlConvert]::ToTimeSpan("$($d.executionTimeLimit)")
+                    $gotLimit = [System.Xml.XmlConvert]::ToTimeSpan("$($live.Settings.ExecutionTimeLimit)")
+                } catch { return $false }
+                if ($gotLimit -ne $wantLimit) { return $false }
 
                 # The live triggers must be exactly the declared set: one per
                 # declared kind, each of a kind declared, none repeated.
@@ -713,11 +712,8 @@ in
                     $triggers += $unlock
                 }
 
-                $settingsArgs = @{ MultipleInstances = $d.multipleInstances }
-                if ($null -ne $d.executionTimeLimit) {
-                    $settingsArgs.ExecutionTimeLimit = [System.Xml.XmlConvert]::ToTimeSpan("$($d.executionTimeLimit)")
-                }
-                $settings = New-ScheduledTaskSettingsSet @settingsArgs
+                $settings = New-ScheduledTaskSettingsSet -MultipleInstances $d.multipleInstances `
+                    -ExecutionTimeLimit ([System.Xml.XmlConvert]::ToTimeSpan("$($d.executionTimeLimit)"))
 
                 # A task with restartTriggers is replaced whole: its running
                 # tree goes before the re-registration and it is started again
